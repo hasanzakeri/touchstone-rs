@@ -69,15 +69,36 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
             values.push(value);
         }
 
+        // The parameter type and value format are properties of the file, so
+        // they are checked before anything that depends on the port count —
+        // an MA file should say so, not complain about a value count.
+        check_option_scope(opts_ref, line.number)?;
+
         let n = match nports {
             Some(n) => n,
-            None => {
-                let inferred = infer_nports(values.len());
-                nports = Some(inferred);
-                inferred
-            }
+            // A value count matching no single-line layout says the line is
+            // malformed, not that the file has that many ports. Report the
+            // count mismatch against this version's only supported shape,
+            // which is the actionable message.
+            None => match infer_nports(values.len()) {
+                Some(inferred) => {
+                    nports = Some(inferred);
+                    inferred
+                }
+                None => {
+                    return Err(err(
+                        line.number,
+                        ParseErrorKind::WrongValueCount {
+                            expected: values_per_point(SUPPORTED_PORTS),
+                            found: values.len(),
+                        },
+                    ));
+                }
+            },
         };
-        check_supported(n, opts_ref, line.number)?;
+        if n != SUPPORTED_PORTS {
+            return Err(err(line.number, ParseErrorKind::UnsupportedPortCount(n)));
+        }
 
         let scale = opts_ref.freq_unit.to_hz();
 
@@ -165,22 +186,24 @@ fn values_per_point(n: usize) -> usize {
     1 + 2 * n * n
 }
 
+/// The only port count this version reads.
+const SUPPORTED_PORTS: usize = 2;
+
 /// Guess the port count from how many values a data line carried.
 ///
 /// Unambiguous for the layouts that fit on one line: 3 values is a 1-port,
-/// 9 a 2-port. Anything else is reported as an unsupported port count, since
-/// wrapped multi-line blocks cannot be resolved from a single line.
-fn infer_nports(value_count: usize) -> usize {
+/// 9 a 2-port. `None` for anything else — a wrapped multi-line block cannot
+/// be resolved from one line, and neither can a malformed one.
+fn infer_nports(value_count: usize) -> Option<usize> {
     match value_count {
-        3 => 1,
-        9 => 2,
-        // 0 means the caller will hit the value-count check instead.
-        other => other,
+        3 => Some(1),
+        9 => Some(2),
+        _ => None,
     }
 }
 
-/// Reject anything outside this version's scope, naming the limit.
-fn check_supported(nports: usize, opts: &Options, line: usize) -> Result<(), Error> {
+/// Reject parameter types and value formats outside this version's scope.
+fn check_option_scope(opts: &Options, line: usize) -> Result<(), Error> {
     if opts.parameter != Parameter::S {
         return Err(err(
             line,
@@ -189,9 +212,6 @@ fn check_supported(nports: usize, opts: &Options, line: usize) -> Result<(), Err
     }
     if opts.format != Format::Ri {
         return Err(err(line, ParseErrorKind::UnsupportedFormat(opts.format)));
-    }
-    if nports != 2 {
-        return Err(err(line, ParseErrorKind::UnsupportedPortCount(nports)));
     }
     Ok(())
 }
@@ -243,11 +263,13 @@ mod tests {
     }
 
     #[test]
-    fn port_count_is_inferred_from_single_line_layouts() {
-        assert_eq!(infer_nports(3), 1);
-        assert_eq!(infer_nports(9), 2);
-        // Not a layout that fits on one line; surfaces as unsupported.
-        assert_eq!(infer_nports(19), 19);
+    fn port_count_is_inferred_only_from_single_line_layouts() {
+        assert_eq!(infer_nports(3), Some(1));
+        assert_eq!(infer_nports(9), Some(2));
+        // A malformed or wrapped line is not a 19-port network.
+        assert_eq!(infer_nports(19), None);
+        assert_eq!(infer_nports(8), None);
+        assert_eq!(infer_nports(0), None);
     }
 
     #[test]
