@@ -17,6 +17,20 @@ pub enum Format {
     Db,
 }
 
+impl Format {
+    /// The option-line keyword for this format, in the spec's uppercase.
+    ///
+    /// One source of truth shared by error messages and, later, the writer,
+    /// so the two cannot drift apart.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Format::Ri => "RI",
+            Format::Ma => "MA",
+            Format::Db => "DB",
+        }
+    }
+}
+
 /// Frequency unit given in the option line. Frequencies are always
 /// normalized to Hz in [`Network::freq_hz`]; this only records the source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +51,16 @@ impl FreqUnit {
             FreqUnit::GHz => 1e9,
         }
     }
+
+    /// The option-line keyword for this unit, in conventional casing.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FreqUnit::Hz => "Hz",
+            FreqUnit::KHz => "kHz",
+            FreqUnit::MHz => "MHz",
+            FreqUnit::GHz => "GHz",
+        }
+    }
 }
 
 /// Network parameter type given in the option line.
@@ -49,6 +73,19 @@ pub enum Parameter {
     G,
     /// Hybrid-h parameters.
     H,
+}
+
+impl Parameter {
+    /// The option-line keyword for this parameter type.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Parameter::S => "S",
+            Parameter::Y => "Y",
+            Parameter::Z => "Z",
+            Parameter::G => "G",
+            Parameter::H => "H",
+        }
+    }
 }
 
 /// Touchstone specification version the file was parsed as.
@@ -162,5 +199,15 @@ mod tests {
     fn freq_unit_conversion() {
         assert_eq!(FreqUnit::GHz.to_hz(), 1e9);
         assert_eq!(FreqUnit::Hz.to_hz(), 1.0);
+    }
+
+    #[test]
+    fn keywords_match_the_option_line_vocabulary() {
+        assert_eq!(Format::Ri.as_str(), "RI");
+        assert_eq!(Format::Db.as_str(), "DB");
+        assert_eq!(FreqUnit::KHz.as_str(), "kHz");
+        assert_eq!(FreqUnit::GHz.as_str(), "GHz");
+        assert_eq!(Parameter::S.as_str(), "S");
+        assert_eq!(Parameter::H.as_str(), "H");
     }
 }
