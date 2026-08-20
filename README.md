@@ -1,5 +1,7 @@
 # touchstone-rs
 
+[![CI](https://github.com/hasanzakeri/touchstone-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/hasanzakeri/touchstone-rs/actions/workflows/ci.yml)
+
 Fast Touchstone (`.sNp`) file I/O for Python, backed by a Rust parser.
 
 Touchstone files are the standard interchange format for RF network
