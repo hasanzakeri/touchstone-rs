@@ -1,0 +1,43 @@
+[build-system]
+# >=1.13.2 required for pyo3 0.29 handling; 1.14 fixes abi3 feature handling
+requires = ["maturin>=1.14,<2"]
+build-backend = "maturin"
+
+[project]
+name = "touchstone-rs"
+version = "0.1.0"
+description = "Fast Touchstone (.sNp) file I/O for Python, backed by a Rust parser"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+authors = [{ name = "Hasan Zakeri" }]
+keywords = ["touchstone", "s-parameters", "rf", "snp", "scikit-rf"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering",
+    "Typing :: Typed",
+]
+dependencies = ["numpy>=1.24"]
+
+[dependency-groups]
+dev = ["maturin>=1.14,<2", "pytest>=8", "pre-commit>=4"]
+
+[tool.maturin]
+manifest-path = "crates/touchstone-py/Cargo.toml"
+module-name = "touchstone_rs._core"
+python-source = "python"
+
+[tool.uv]
+# Rebuild the extension when Rust sources change, not just pyproject.toml.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "crates/**/Cargo.toml" },
+    { file = "crates/**/*.rs" },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
