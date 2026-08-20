@@ -23,6 +23,10 @@ classifiers = [
 ]
 dependencies = ["numpy>=1.24"]
 
+[project.urls]
+Repository = "https://github.com/hasanzakeri/touchstone-rs"
+Issues = "https://github.com/hasanzakeri/touchstone-rs/issues"
+
 [dependency-groups]
 dev = ["maturin>=1.14,<2", "pytest>=8", "pre-commit>=4"]
 
