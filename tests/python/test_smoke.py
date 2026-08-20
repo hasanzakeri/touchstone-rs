@@ -2,7 +2,6 @@
 
 import numpy as np
 import pytest
-
 import touchstone_rs as ts
 
 
