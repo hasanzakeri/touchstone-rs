@@ -11,6 +11,7 @@
 use std::path::Path;
 
 mod error;
+mod lines;
 mod model;
 
 pub use error::{Error, ParseErrorKind};
