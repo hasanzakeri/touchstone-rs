@@ -13,6 +13,7 @@ use std::path::Path;
 mod error;
 mod lines;
 mod model;
+mod option_line;
 
 pub use error::{Error, ParseErrorKind};
 pub use model::{Format, FreqUnit, Metadata, Network, NoiseData, Parameter, Version};
