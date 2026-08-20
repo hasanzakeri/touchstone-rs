@@ -11,6 +11,8 @@ repos:
       - id: check-yaml
       - id: check-toml
       - id: check-merge-conflict
+      - id: no-commit-to-branch
+        args: [--branch, main]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.16.3

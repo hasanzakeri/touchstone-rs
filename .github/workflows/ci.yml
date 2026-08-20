@@ -5,6 +5,9 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+    # Default types plus ready_for_review, so CI runs when a draft graduates;
+    # draft PRs themselves are skipped via the job-level `if` guards.
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 env:
@@ -13,6 +16,7 @@ env:
 jobs:
   rust:
     name: rust checks
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -26,6 +30,7 @@ jobs:
 
   python:
     name: pytest (py${{ matrix.python }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -43,6 +48,7 @@ jobs:
 
   wheel-linux:
     name: abi3 wheel (linux)
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
