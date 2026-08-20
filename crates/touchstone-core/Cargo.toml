@@ -1,0 +1,13 @@
+[package]
+name = "touchstone-core"
+description = "Parser and writer for Touchstone (.sNp) RF network parameter files"
+keywords = ["touchstone", "s-parameters", "rf", "snp", "parser"]
+categories = ["parser-implementations", "science"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+num-complex.workspace = true
+thiserror.workspace = true

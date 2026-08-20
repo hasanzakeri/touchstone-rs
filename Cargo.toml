@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/touchstone-core", "crates/touchstone-py"]
+members = ["crates/touchstone-core"]
 resolver = "3"
 
 [workspace.package]
