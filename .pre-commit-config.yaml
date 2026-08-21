@@ -23,6 +23,16 @@ repos:
 
   - repo: local
     hooks:
+      # Reads its include list and strictness from [tool.pyright] in
+      # pyproject.toml, so it checks the whole package rather than the
+      # staged subset -- hence pass_filenames: false.
+      - id: pyright
+        name: pyright
+        entry: uv run pyright
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+
       - id: cargo-fmt
         name: cargo fmt
         entry: cargo fmt --all --check
