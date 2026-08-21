@@ -104,9 +104,14 @@ pub struct Metadata {
     pub format: Format,
     /// The `R` value from the option line.
     pub resistance: f64,
-    /// The option line exactly as it appeared in the file, if any.
+    /// The option line as it appeared in the file, if any — trimmed, with
+    /// any trailing `!` comment stripped, but otherwise verbatim (original
+    /// spacing and case intact) so a write can reproduce the source style.
     pub option_line: Option<String>,
-    /// Comment lines (`!`), in order of appearance.
+    /// Comment lines (`!`) seen before the first data line, in order, with
+    /// the leading `!` removed. Comments trailing a data line are not
+    /// retained, so this is not a complete record of every comment in the
+    /// source file — see ADR 0004.
     pub comments: Vec<String>,
 }
 

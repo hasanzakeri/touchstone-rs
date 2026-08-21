@@ -8,7 +8,12 @@ use std::fmt;
 use crate::model::{Format, Parameter};
 
 /// Errors produced while reading or parsing a Touchstone file.
+///
+/// `#[non_exhaustive]`: this will grow (v2 keyword errors, writer errors),
+/// and each addition would otherwise be a breaking change for any caller
+/// matching on it exhaustively.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("failed to read {path}")]
     Io {
@@ -18,8 +23,6 @@ pub enum Error {
     },
     #[error("line {line}: {kind}")]
     Parse { line: usize, kind: ParseErrorKind },
-    #[error("not implemented yet: {0}")]
-    Unimplemented(&'static str),
 }
 
 /// What went wrong on a given line. Grows with the parser.

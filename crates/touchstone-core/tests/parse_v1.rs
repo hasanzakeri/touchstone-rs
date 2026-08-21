@@ -349,14 +349,66 @@ fn a_noise_section_is_reported_by_name_not_as_an_ordering_error() {
     );
 }
 
+/// Noise detection compares against the last S-parameter frequency because
+/// spec v1.1 guarantees genuine noise data satisfies that bound (the lowest
+/// noise frequency is always at or below the highest network-parameter
+/// frequency). A file whose 5-value tail keeps *ascending* past the S-sweep
+/// is already non-conformant a second way, and this version does not try to
+/// guess that it's noise — it reports the generic, still-accurate
+/// value-count mismatch instead. Deliberate, not an oversight: dropping the
+/// frequency comparison entirely would misclassify a legitimate M2-style
+/// wrapped 2-port continuation (which also has 5 values on its first line)
+/// as an unsupported noise section.
+#[test]
+fn a_five_value_line_that_keeps_ascending_is_not_mistaken_for_noise() {
+    assert_eq!(
+        kind("# GHZ S RI R 50\n1.0 0 0 0 0 0 0 0 0\n2.0 0 0 0 0\n"),
+        ParseErrorKind::WrongValueCount {
+            expected: 9,
+            found: 5,
+        }
+    );
+}
+
+#[test]
+fn nan_and_infinite_values_are_rejected_like_any_other_bad_token() {
+    // Rust's f64 parser accepts "nan"/"inf" as valid tokens; neither is a
+    // usable network value, and letting one through would be exactly the
+    // plausible-looking wrong data ADR 0004 argues against.
+    assert_eq!(
+        kind("# GHZ S RI R 50\n1.0 nan 0 0 0 0 0 0 0\n"),
+        ParseErrorKind::InvalidNumber("nan".into())
+    );
+    assert_eq!(
+        kind("# GHZ S RI R 50\n1.0 0 inf 0 0 0 0 0 0\n"),
+        ParseErrorKind::InvalidNumber("inf".into())
+    );
+    assert_eq!(
+        kind("# GHZ S RI R 50\ninf 0 0 0 0 0 0 0 0\n"),
+        ParseErrorKind::InvalidNumber("inf".into())
+    );
+}
+
 #[test]
 fn the_unsupported_format_message_reads_as_a_scope_limit() {
     // This is the first error most new users will see, so its wording is
-    // pinned, not just its variant.
+    // pinned, not just its variant. Reported at the option line (line 1),
+    // since the format is a property of the option line, not the data row.
     let err = parse_str("# GHZ S MA R 50\n1.0 0 0 0 0 0 0 0 0\n").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "line 2: unsupported format ma: only ri is supported in this version"
+        "line 1: unsupported format ma: only ri is supported in this version"
+    );
+}
+
+/// An out-of-scope option line is reported immediately, even with no data
+/// lines at all — a better diagnosis than "no data lines", which would be
+/// true but useless: the file wouldn't parse even if it had data.
+#[test]
+fn an_out_of_scope_format_is_reported_even_without_any_data() {
+    assert_eq!(
+        kind("# GHZ S MA R 50\n"),
+        ParseErrorKind::UnsupportedFormat(Format::Ma)
     );
 }
 

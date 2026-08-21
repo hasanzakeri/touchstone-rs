@@ -51,7 +51,14 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
         if let Some(body) = line.content.strip_prefix('#') {
             // Spec v1.1 §3: option lines after the first are ignored.
             if options.is_none() {
-                options = Some(parse_option_line(body, line.number)?);
+                let parsed = parse_option_line(body, line.number)?;
+                // Checked here, once, against the option line itself — not
+                // once per data row. This is a property of the file, not of
+                // any particular row, so a data line should never be blamed
+                // for it, and a format-only file (no data at all) should
+                // report the format problem rather than "no data lines".
+                check_option_scope(&parsed, line.number)?;
+                options = Some(parsed);
                 option_line = Some(line.content.to_string());
                 option_line_number = Some(line.number);
             }
@@ -70,13 +77,19 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
                     ParseErrorKind::InvalidNumber(token.to_string()),
                 )
             })?;
+            // Rust's f64 parser accepts "nan" and "inf" as valid tokens, but
+            // neither is a usable network value, and letting one through
+            // would be exactly the silently-plausible-looking wrong data
+            // ADR 0004 argues against. Reported the same way as any other
+            // unparseable token, since from the file's perspective it is one.
+            if !value.is_finite() {
+                return Err(err(
+                    line.number,
+                    ParseErrorKind::InvalidNumber(token.to_string()),
+                ));
+            }
             values.push(value);
         }
-
-        // The parameter type and value format are properties of the file, so
-        // they are checked before anything that depends on the port count —
-        // an MA file should say so, not complain about a value count.
-        check_option_scope(opts_ref, line.number)?;
 
         let n = match nports {
             Some(n) => n,
@@ -108,11 +121,24 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
 
         // A noise section is five values per line whose frequency steps back
         // into the already-covered sweep — which is exactly how the spec says
-        // a reader locates the boundary. Detected here so the failure names
-        // itself instead of surfacing as a value-count or ordering error.
-        if n == 2 && values.len() == NOISE_VALUES_PER_LINE && !freq_hz.is_empty() {
+        // a reader locates the boundary (the lowest noise frequency must be
+        // at or below the highest network-parameter frequency), so this is
+        // provably correct for any conformant file. `n` is already known to
+        // be `SUPPORTED_PORTS` here (checked above). `freq_hz.is_empty()` is
+        // deliberately excluded: a 5-value *first* data line could still be
+        // the first half of an M2-style wrapped 2-port block, which this
+        // check must not misdiagnose as noise.
+        //
+        // A file whose bogus noise-shaped tail keeps climbing past the
+        // S-sweep (itself non-conformant, per the spec quoted above) falls
+        // through to the generic value-count error below instead — less
+        // specific, but not wrong. See
+        // `a_five_value_line_that_keeps_ascending_is_not_mistaken_for_noise`.
+        if values.len() == NOISE_VALUES_PER_LINE
+            && let Some(&last_s_freq) = freq_hz.last()
+        {
             let candidate = values[0] * scale;
-            if freq_hz[freq_hz.len() - 1] >= candidate {
+            if last_s_freq >= candidate {
                 return Err(err(line.number, ParseErrorKind::NoiseSectionUnsupported));
             }
         }
@@ -242,13 +268,19 @@ fn push_point(s: &mut Vec<Complex64>, pairs: &[f64], nports: usize, format: Form
 
 /// Build a complex value from an on-disk pair.
 ///
-/// Only `RI` is reachable: [`check_supported`] rejects `MA` and `DB` before
-/// any data is read. The MA/DB conversions land with the all-formats
-/// milestone; the fallthrough is deliberately a value rather than a panic.
+/// Only `RI` is reachable: [`check_option_scope`] rejects `MA` and `DB`
+/// before any data is read, and it runs as soon as the option line parses —
+/// before this function can ever be called. Panicking rather than silently
+/// reinterpreting a magnitude/angle pair as real/imaginary is the point: a
+/// wrong-but-plausible number is exactly what ADR 0004 argues is worse than
+/// a hard failure. The MA/DB conversions land with the all-formats
+/// milestone, which is what turns this from unreachable into real code.
 fn to_complex(a: f64, b: f64, format: Format) -> Complex64 {
     match format {
         Format::Ri => Complex64::new(a, b),
-        Format::Ma | Format::Db => Complex64::new(a, b),
+        Format::Ma | Format::Db => {
+            unreachable!("check_option_scope rejects {format:?} before any data is read")
+        }
     }
 }
 
@@ -259,6 +291,14 @@ fn err(line: usize, kind: ParseErrorKind) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "check_option_scope rejects")]
+    fn to_complex_panics_rather_than_silently_misreading_ma_or_db() {
+        // A wrong-but-plausible number is worse than a hard failure (ADR
+        // 0004); this proves the invariant is enforced loudly, not silently.
+        to_complex(1.0, 2.0, Format::Ma);
+    }
 
     #[test]
     fn values_per_point_counts_a_frequency_plus_one_pair_per_entry() {
