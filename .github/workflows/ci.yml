@@ -14,6 +14,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ruff and pyright are driven through .pre-commit-config.yaml rather than
+  # re-declared here, so a hook version bump reaches CI and developer machines
+  # at the same time. Only pre-commit-stage hooks run, which leaves clippy,
+  # cargo test and pytest to the jobs below; cargo fmt is skipped because the
+  # rust job already covers it and a toolchain install just for it is not worth
+  # the runner minute.
+  lint:
+    name: lint (ruff + pyright)
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+      # --no-install-project keeps the Rust extension out of this job: pyright
+      # resolves the package through [tool.pyright] extraPaths and the
+      # checked-in _core.pyi stub, so nothing here needs compiling. UV_NO_SYNC
+      # stops the nested `uv run pyright` in the hook from reinstating it.
+      - run: uv sync --no-install-project
+      - run: uv run pre-commit run --all-files --show-diff-on-failure
+        env:
+          UV_NO_SYNC: "1"
+          SKIP: cargo-fmt
+
   rust:
     name: rust checks
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
