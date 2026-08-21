@@ -1,10 +1,17 @@
-//! End-to-end tests for Touchstone v1, 2-port, `RI` files.
+//! End-to-end tests for Touchstone v1 files.
 //!
-//! Fixtures are inline `&str` consts rather than files on purpose: CRLF and
-//! trailing-whitespace cases are invisible in a file, and the repository's
-//! `trailing-whitespace` / `end-of-file-fixer` hooks would silently rewrite
-//! such a fixture and break the test. `tests/data/` holds full-length files
-//! whose provenance is documented; the shape of the grammar is pinned here.
+//! Two kinds of fixture, deliberately:
+//!
+//! - **Inline `&str` consts** pin the shape of the grammar. CRLF and
+//!   trailing-whitespace cases are invisible in a file, and generated inputs
+//!   reach port counts nobody is going to export by hand.
+//! - **Real files from `tests/data/`**, pulled in with `include_str!`, prove
+//!   the parser agrees with what a tool actually writes rather than only with
+//!   itself. Their provenance is documented in that directory's README.
+//!
+//! The two are not redundant. A generated 4-port fixture proves the wrapping
+//! logic is self-consistent; only the ADS export proves that self-consistent
+//! reading is also the *right* one.
 
 use std::path::Path;
 
@@ -35,12 +42,40 @@ fn kind(input: &str) -> ParseErrorKind {
 /// `MA` and `DB` go through `cos`/`sin` and `powf`, so a value that is exact
 /// on disk in one format is only near-exact in another. Comparisons that
 /// cross a format boundary use this; `RI` comparisons stay exact.
+///
+/// The bound suits hand-written fixtures, whose values are exact on disk.
+/// Real exports need [`assert_agrees`], which allows for their own rounding.
 fn assert_close(actual: Complex64, expected: Complex64, what: &str) {
     let error = (actual - expected).l1_norm();
     assert!(
         error < 1e-9,
         "{what}: expected {expected}, got {actual} (off by {error})"
     );
+}
+
+/// Two readings of the same real device must agree everywhere.
+///
+/// The bound is set by the *files*, not by the conversion: the ADS exports
+/// carry nine significant figures, so `RI` and the reconstruction from a
+/// rounded magnitude and angle cannot agree more closely than about 1e-8 no
+/// matter how exact the arithmetic is.
+fn assert_agrees(actual: &Network, expected: &Network, what: &str) {
+    assert_eq!(actual.nports, expected.nports, "{what}: port count");
+    assert_eq!(actual.freq_hz, expected.freq_hz, "{what}: frequencies");
+    assert_eq!(actual.z0, expected.z0, "{what}: reference impedance");
+    for fi in 0..expected.nfreqs() {
+        for row in 0..expected.nports {
+            for col in 0..expected.nports {
+                let (a, e) = (actual.at(fi, row, col), expected.at(fi, row, col));
+                assert!(
+                    (a - e).l1_norm() < 1e-7,
+                    "{what}: S({},{}) at point {fi}: expected {e}, got {a}",
+                    row + 1,
+                    col + 1
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- happy path
@@ -848,6 +883,267 @@ fn the_three_ads_exports_of_one_device_agree() {
 
     // The device is unilateral: S12 is a true zero, written `-inf` dB.
     assert_eq!(db.at(0, 0, 1).l1_norm(), 0.0, "S12 from -inf dB");
+}
+
+// -------------------------------------- real 1-port ADS exports, varied
+
+/// One 1-port device, exported repeatedly with a single thing changed each
+/// time: the frequency unit, the number spelling, or the precision. Each
+/// pair below isolates exactly one axis, so a failure names its own cause.
+mod one_port {
+    use super::*;
+
+    const RI_GHZ: &str = include_str!("../../../tests/data/ads_1port_ri_ghz.s1p");
+    const RI_GHZ_SCI: &str = include_str!("../../../tests/data/ads_1port_ri_ghz_scientific.s1p");
+    const MA_GHZ: &str = include_str!("../../../tests/data/ads_1port_ma_ghz.s1p");
+    const MA_MHZ: &str = include_str!("../../../tests/data/ads_1port_ma_mhz.s1p");
+    const MA_HZ: &str = include_str!("../../../tests/data/ads_1port_ma_hz.s1p");
+    const DB_GHZ: &str = include_str!("../../../tests/data/ads_1port_db_ghz.s1p");
+    const DB_LOW_PRECISION: &str =
+        include_str!("../../../tests/data/ads_1port_db_ghz_low_precision.s1p");
+
+    #[test]
+    fn a_real_one_port_export_reads_its_single_entry() {
+        let net = ok(RI_GHZ);
+        assert_eq!(net.nports, 1);
+        assert_eq!(net.nfreqs(), 30);
+        assert_eq!(net.s.len(), 30);
+        assert_eq!(net.z0, [50.0]);
+        assert_eq!(net.freq_hz[0], 50e6, "0.05 GHz");
+        assert_eq!(net.freq_hz[29], 1.5e9);
+        assert_eq!(net.at(0, 0, 0), Complex64::new(0.973077725, -0.144262395));
+        assert_eq!(net.at(29, 0, 0), Complex64::new(0.792504104, 0.367509596));
+    }
+
+    /// The same sweep written in Hz, MHz and GHz. Normalization happens on
+    /// read, so all three must land on **bit-identical** arrays — not merely
+    /// close ones, since 0.05 GHz, 50 MHz and 50000000 Hz name one number.
+    #[test]
+    fn the_frequency_unit_changes_the_file_but_not_the_result() {
+        let ghz = ok(MA_GHZ);
+        for (unit, other) in [("mhz", ok(MA_MHZ)), ("hz", ok(MA_HZ))] {
+            assert_eq!(other.freq_hz, ghz.freq_hz, "{unit}: frequencies");
+            assert_eq!(other.s, ghz.s, "{unit}: values");
+        }
+        assert_eq!(ghz.metadata.freq_unit, FreqUnit::GHz);
+        assert_eq!(ok(MA_MHZ).metadata.freq_unit, FreqUnit::MHz);
+        assert_eq!(ok(MA_HZ).metadata.freq_unit, FreqUnit::Hz);
+    }
+
+    /// `5.000000000e-02` and `0.05` are the same number. The exponent form
+    /// is what QUCS and several instruments emit, and it applies to the
+    /// frequency column as much as to the values — the frequencies here must
+    /// come out exactly equal, not merely close.
+    #[test]
+    fn scientific_notation_reads_as_the_same_number_as_decimal() {
+        let plain = ok(RI_GHZ);
+        let scientific = ok(RI_GHZ_SCI);
+        assert_eq!(scientific.freq_hz, plain.freq_hz);
+        assert_agrees(&scientific, &plain, "scientific notation");
+    }
+
+    /// An export rounded to four significant figures rather than nine. It
+    /// must parse identically in structure and land near the full-precision
+    /// reading — the tolerance is the file's, not the parser's, which is the
+    /// point: rounding in the source is not an error to be rejected.
+    #[test]
+    fn a_low_precision_export_parses_and_stays_within_its_own_rounding() {
+        let full = ok(DB_GHZ);
+        let coarse = ok(DB_LOW_PRECISION);
+        assert_eq!(coarse.nports, 1);
+        assert_eq!(coarse.freq_hz, full.freq_hz);
+        for fi in 0..full.nfreqs() {
+            let error = (coarse.at(fi, 0, 0) - full.at(fi, 0, 0)).l1_norm();
+            assert!(error < 1e-3, "point {fi} drifted by {error}");
+        }
+    }
+
+    /// The 1-port device in all three formats, same check as the multi-port
+    /// families get.
+    #[test]
+    fn the_one_port_exports_agree_across_all_three_formats() {
+        let ri = ok(RI_GHZ);
+        assert_agrees(&ok(MA_GHZ), &ri, "1-port ma");
+        assert_agrees(&ok(DB_GHZ), &ri, "1-port db");
+    }
+}
+
+// ------------------------------------------ real multi-port ADS exports
+
+/// The multi-port exports, generated in Keysight ADS for this milestone.
+///
+/// All are **non-reciprocal** and **frequency-dependent** by construction,
+/// and neither property is decoration. A reciprocal device cannot catch a
+/// transposed read, because `S(i,j) == S(j,i)` makes the bug invisible — the
+/// reason the spec's own 3-port example (a power divider) would be useless
+/// here. A frequency-flat device cannot catch a data-set boundary that slips
+/// by a whole point, because every point would then be wrong identically and
+/// still self-consistent. See `tests/data/README.md`.
+mod multiport {
+    use super::*;
+
+    const RI_3: &str = include_str!("../../../tests/data/ads_asymmetric_3port_ri.s3p");
+    const MA_3: &str = include_str!("../../../tests/data/ads_asymmetric_3port_ma.s3p");
+    const DB_3: &str = include_str!("../../../tests/data/ads_asymmetric_3port_db.s3p");
+    const RI_4: &str = include_str!("../../../tests/data/ads_asymmetric_4port_ri.s4p");
+    const MA_4: &str = include_str!("../../../tests/data/ads_asymmetric_4port_ma.s4p");
+    const DB_4: &str = include_str!("../../../tests/data/ads_asymmetric_4port_db.s4p");
+    const RI_4_SCI: &str =
+        include_str!("../../../tests/data/ads_asymmetric_4port_ri_scientific.s4p");
+    const RI_16: &str = include_str!("../../../tests/data/ads_asymmetric_16port_ri.s16p");
+    const MA_16: &str = include_str!("../../../tests/data/ads_asymmetric_16port_ma.s16p");
+    const DB_16: &str = include_str!("../../../tests/data/ads_asymmetric_16port_db.s16p");
+
+    /// Every entry of `net` differs from its transpose, so any test built on
+    /// this file is capable of failing when the matrix is transposed.
+    fn assert_not_reciprocal(net: &Network) {
+        let mut off_diagonal = 0;
+        for fi in 0..net.nfreqs() {
+            for row in 0..net.nports {
+                for col in 0..row {
+                    assert_ne!(
+                        net.at(fi, row, col),
+                        net.at(fi, col, row),
+                        "S({},{}) equals its transpose at point {fi}; this fixture \
+                         cannot detect a transposed read",
+                        row + 1,
+                        col + 1
+                    );
+                    off_diagonal += 1;
+                }
+            }
+        }
+        assert!(off_diagonal > 0);
+    }
+
+    /// A 3-port data set is three lines of 7, 6, 6 tokens. The two values
+    /// below are the second pair of the set's first line and the first pair
+    /// of its second line — S(1,2) and S(2,1). Reading the matrix
+    /// column-major, or applying the 2-port's 21-before-12 rule here, swaps
+    /// exactly these two.
+    #[test]
+    fn a_real_three_port_export_is_row_major() {
+        let net = ok(RI_3);
+        assert_eq!(net.nports, 3);
+        assert_eq!(net.nfreqs(), 10);
+        assert_eq!(net.freq_hz[0], 1e9);
+        assert_eq!(net.freq_hz[9], 10e9);
+        assert_not_reciprocal(&net);
+
+        assert_eq!(
+            net.at(0, 0, 1),
+            Complex64::new(-0.170972558, 0.0284282697),
+            "S(1,2), the second pair of the data set's first line"
+        );
+        assert_eq!(
+            net.at(0, 1, 0),
+            Complex64::new(-0.0999570284, -0.0120456901),
+            "S(2,1), the first pair of the data set's second line"
+        );
+        assert_eq!(
+            net.at(9, 2, 2),
+            Complex64::new(-0.552727569, -0.480091487),
+            "S(3,3) at the last point, the final pair of the final data set"
+        );
+    }
+
+    /// A 4-port data set opens with nine tokens — the same shape a
+    /// *complete* 2-port set has. Only running on to 33 values distinguishes
+    /// them, so the port count here is the assertion.
+    #[test]
+    fn a_real_four_port_export_is_not_read_as_a_two_port() {
+        let net = ok(RI_4);
+        assert_eq!(net.nports, 4, "nine tokens on the set's first line");
+        assert_eq!(net.nfreqs(), 10);
+        assert_not_reciprocal(&net);
+
+        assert_eq!(
+            net.at(0, 0, 0),
+            Complex64::new(0.48734362, 0.15525673),
+            "S(1,1)"
+        );
+        assert_eq!(
+            net.at(0, 0, 3),
+            Complex64::new(0.0073463711, 0.0483004276),
+            "S(1,4), the last pair of the set's first line"
+        );
+        assert_eq!(
+            net.at(0, 3, 0),
+            Complex64::new(0.00380342348, -0.0139156333),
+            "S(4,1), which a transposed read would swap with S(1,4)"
+        );
+    }
+
+    /// Sixteen ports is the layout 3- and 4-port files never produce: a
+    /// single matrix *row* is sixteen pairs, so it spans four lines and a
+    /// data set contains lines that are neither its first nor a row start.
+    /// The file's lines run `9, 8, 8, 8, …` — one odd line per data set, 64
+    /// lines apiece.
+    #[test]
+    fn a_real_sixteen_port_export_wraps_each_matrix_row_over_four_lines() {
+        let net = ok(RI_16);
+        assert_eq!(net.nports, 16);
+        assert_eq!(net.nfreqs(), 10);
+        assert_eq!(net.s.len(), 10 * 256);
+        assert_eq!(net.z0.len(), 16);
+        assert_not_reciprocal(&net);
+
+        // S(1,16) closes row 1, on the *fourth* line of the data set; a
+        // reader that stopped wrapping after one continuation line would
+        // never reach it.
+        assert_eq!(
+            net.at(0, 0, 15),
+            Complex64::new(0.0581396322, -0.0160554818),
+            "S(1,16)"
+        );
+        // S(16,1) opens row 16, on the set's 61st line.
+        assert_eq!(
+            net.at(0, 15, 0),
+            Complex64::new(0.24924568, -0.0646806443),
+            "S(16,1)"
+        );
+        assert_eq!(
+            net.at(9, 15, 15),
+            Complex64::new(-0.370522595, -0.0637966795),
+            "S(16,16) at the last point"
+        );
+    }
+
+    /// Exponent-form numbers inside a *wrapped* data set. The 1-port
+    /// scientific fixture covers the spelling on its own; what is new here
+    /// is that a token like `4.870256e-01` is still one token to
+    /// `split_whitespace`, so the token counts the data-set boundary rule
+    /// depends on are unchanged by the notation.
+    #[test]
+    fn scientific_notation_survives_a_wrapped_multiport_data_set() {
+        let plain = ok(RI_4);
+        let scientific = ok(RI_4_SCI);
+        assert_eq!(scientific.nports, 4);
+        assert_eq!(scientific.nfreqs(), 10);
+        assert_agrees(&scientific, &plain, "4-port scientific notation");
+    }
+
+    /// Each device exported three ways. This is the check that needs no
+    /// hand-computed expectations at all: a wrong dB base, a degrees/radians
+    /// slip, or a sign error in the angle fails it immediately, at every
+    /// port count and across 2,560 values for the 16-port pair alone.
+    #[test]
+    fn the_multiport_exports_agree_across_all_three_formats() {
+        for (n, ri, ma, db) in [
+            (3, RI_3, MA_3, DB_3),
+            (4, RI_4, MA_4, DB_4),
+            (16, RI_16, MA_16, DB_16),
+        ] {
+            let reference = ok(ri);
+            assert_eq!(reference.nports, n);
+            let ma = ok(ma);
+            let db = ok(db);
+            assert_eq!(ma.metadata.format, Format::Ma);
+            assert_eq!(db.metadata.format, Format::Db);
+            assert_agrees(&ma, &reference, &format!("{n}-port ma"));
+            assert_agrees(&db, &reference, &format!("{n}-port db"));
+        }
+    }
 }
 
 /// The QUCS export of the same device: no `!` header at all, verbose

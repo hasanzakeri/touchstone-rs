@@ -17,6 +17,10 @@ import touchstone_rs as ts
 # in file order, which spec v1.1 §3 defines as S11 S21 S12 S22.
 UNILATERAL = "# MHZ S RI R 50\n1.0  0.1 0.2  9.0 9.1  0.01 0.02  0.3 0.4\n"
 
+# Committed fixtures, for the tests that need a real tool's output rather
+# than a hand-written string. See tests/data/README.md for provenance.
+DATA = Path(__file__).resolve().parents[1] / "data"
+
 
 def write(tmp_path: Path, text: str, name: str = "device.s2p") -> Path:
     path = tmp_path / name
@@ -104,27 +108,36 @@ def test_an_unsupported_parameter_says_what_is_supported(tmp_path: Path) -> None
         ts.read(write(tmp_path, "# GHZ Y RI R 50\n1.0 0 0 0 0 0 0 0 0\n"))
 
 
-def test_a_multiport_file_crosses_into_numpy_with_the_right_shape(
-    tmp_path: Path,
-) -> None:
-    # A 4-port set spans four lines, and its first line holds nine tokens --
-    # the same shape as a complete 2-port line. The array shape is the proof
-    # that the port count survived the crossing, not just the parse.
-    text = "# GHZ S RI R 50\n"
-    for freq in (1.0, 2.0):
-        for row in range(4):
-            values = " ".join(f"{(row + 1) * 10 + col + 1} 0" for col in range(4))
-            prefix = f"{freq} " if row == 0 else ""
-            text += f"{prefix}{values}\n"
-    net = ts.read(write(tmp_path, text, name="coupler.s4p"))
+def test_a_real_multiport_export_crosses_into_numpy_with_the_right_shape() -> None:
+    # A real 16-port ADS export: 64 lines per data set, and a single matrix
+    # row spans four of them. The array shape is the proof that the port
+    # count survived the crossing into NumPy, not just the parse.
+    net = ts.read(DATA / "ads_asymmetric_16port_ri.s16p")
 
-    assert net.nports == 4
-    assert net.s.shape == (2, 4, 4)
-    assert net.z0.shape == (4,)
-    # Row-major, so S(2,3) is 23 -- a transposed read would give 32.
-    assert net.s[0, 1, 2] == 23 + 0j
-    assert net.s[0, 2, 1] == 32 + 0j
-    assert repr(net) == "<Network 4-port, 2 frequency points>"
+    assert net.nports == 16
+    assert net.s.shape == (10, 16, 16)
+    assert net.z0.shape == (16,)
+    assert net.s.dtype == np.complex128
+    assert repr(net) == "<Network 16-port, 10 frequency points>"
+
+    # Non-reciprocal by construction, so a transpose anywhere in the stack is
+    # visible here. S(1,16) closes row 1 on the data set's fourth line;
+    # S(16,1) opens row 16 on its 61st.
+    assert net.s[0, 0, 15] == 0.0581396322 - 0.0160554818j
+    assert net.s[0, 15, 0] == 0.24924568 - 0.0646806443j
+    assert net.s[0, 0, 15] != net.s[0, 15, 0], "the fixture must not be reciprocal"
+
+
+def test_a_real_multiport_export_agrees_across_formats() -> None:
+    # The same device written three ways. Nothing here is hand-computed, so a
+    # conversion bug cannot be hidden by a matching expectation.
+    ri = ts.read(DATA / "ads_asymmetric_4port_ri.s4p")
+    for name in ("ma", "db"):
+        other = ts.read(DATA / f"ads_asymmetric_4port_{name}.s4p")
+        np.testing.assert_array_equal(other.f, ri.f, err_msg=name)
+        # 1e-7 is the files' nine significant figures talking, not the
+        # conversion arithmetic.
+        np.testing.assert_allclose(other.s, ri.s, atol=1e-7, err_msg=name)
 
 
 def test_a_one_port_file_reads_as_a_one_by_one_matrix(tmp_path: Path) -> None:
