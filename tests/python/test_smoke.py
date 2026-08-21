@@ -8,20 +8,20 @@ import pytest
 import touchstone_rs as ts
 
 
-def test_version():
+def test_version() -> None:
     assert ts.__version__ == "0.1.0"
 
 
-def test_error_is_valueerror_subclass():
+def test_error_is_valueerror_subclass() -> None:
     assert issubclass(ts.TouchstoneError, ValueError)
 
 
-def test_read_missing_file_raises():
+def test_read_missing_file_raises() -> None:
     with pytest.raises(ts.TouchstoneError, match="failed to read"):
         ts.read("does-not-exist.s2p")
 
 
-def test_network_from_arrays():
+def test_network_from_arrays() -> None:
     f = np.array([1e9, 2e9, 3e9])
     s = np.zeros((3, 2, 2), dtype=np.complex128)
     s[1, 1, 0] = 0.5 - 0.25j
@@ -39,7 +39,7 @@ def test_network_from_arrays():
     assert repr(net) == "<Network 2-port, 3 frequency points>"
 
 
-def test_network_custom_z0():
+def test_network_custom_z0() -> None:
     f = np.array([1e9])
     s = np.zeros((1, 3, 3), dtype=np.complex128)
     net = ts.Network(f, s, z0=np.array([50.0, 75.0, 50.0]))
@@ -53,7 +53,9 @@ def test_network_custom_z0():
         (3, (3, 2, 3), "shape"),
     ],
 )
-def test_network_shape_validation(f_len, s_shape, match):
+def test_network_shape_validation(
+    f_len: int, s_shape: tuple[int, int, int], match: str
+) -> None:
     f = np.linspace(1e9, 2e9, f_len)
     s = np.zeros(s_shape, dtype=np.complex128)
     with pytest.raises(ValueError, match=match):
