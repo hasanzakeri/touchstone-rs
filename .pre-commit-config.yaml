@@ -14,15 +14,25 @@ repos:
       - id: no-commit-to-branch
         args: [--branch, main]
 
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.3
-    hooks:
-      - id: ruff-check
-        args: [--fix]
-      - id: ruff-format
-
   - repo: local
     hooks:
+      # ruff and pyright run from the dev group rather than a mirror repo, so
+      # uv.lock is the single version pin and CI cannot drift from what runs
+      # here. Bump them with `uv lock --upgrade-package ruff`.
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --fix --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
       # Reads its include list and strictness from [tool.pyright] in
       # pyproject.toml, so it checks the whole package rather than the
       # staged subset -- hence pass_filenames: false.
