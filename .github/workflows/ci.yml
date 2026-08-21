@@ -63,14 +63,12 @@ jobs:
 
   # macOS runners are scarce/slow and Windows adds little signal per commit
   # for a text parser; native wheels are verified on tags and manual runs.
-  wheels-native:
-    name: abi3 wheel (${{ matrix.os }})
+  # Spelled out rather than a matrix so the skipped checks on a PR still read
+  # as an OS name instead of an uninterpolated `${{ matrix.os }}`.
+  wheel-macos:
+    name: abi3 wheel (macos)
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -79,5 +77,20 @@ jobs:
       - run: uvx maturin build --release --out dist
       - uses: actions/upload-artifact@v7
         with:
-          name: wheel-${{ matrix.os }}
+          name: wheel-macos
+          path: dist/*.whl
+
+  wheel-windows:
+    name: abi3 wheel (windows)
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v10.0.1
+      - run: uvx maturin build --release --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-windows
           path: dist/*.whl
