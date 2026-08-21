@@ -6,9 +6,11 @@
 //! such a fixture and break the test. `tests/data/` holds full-length files
 //! whose provenance is documented; the shape of the grammar is pinned here.
 
+use std::path::Path;
+
 use touchstone_core::{
     Complex64, Error, Format, FreqUnit, Network, Parameter, ParseErrorKind, ParseOptions, Version,
-    parse_str, parse_str_with,
+    parse_file, parse_str, parse_str_with,
 };
 
 /// The smallest file this version accepts.
@@ -367,4 +369,54 @@ fn a_bad_option_line_is_reported_at_its_own_line() {
         kind,
         ParseErrorKind::InvalidOptionLine("unknown token 'nonsense'".into())
     );
+}
+
+// ----------------------------------------------------------------- real file
+
+/// A unilateral 2-port simulated in Keysight ADS: S12 is zero, S21 is large,
+/// S11 differs from S22 — the ordering guard's real-world counterpart. See
+/// `tests/data/README.md` for provenance. Read via `include_str!` rather
+/// than at runtime, so `cargo package`/`cargo test --workspace` never
+/// depends on the file surviving a move.
+const REAL_FILE: &str = include_str!("../../../tests/data/ads_unilateral_2port_ri.s2p");
+
+#[test]
+fn a_real_ads_export_parses_and_matches_its_known_values() {
+    let net = ok(REAL_FILE);
+
+    assert_eq!(net.nports, 2);
+    assert_eq!(net.nfreqs(), 10);
+    assert_eq!(net.freq_hz[0], 1e9);
+    assert_eq!(net.freq_hz[9], 10e9);
+    assert_eq!(net.z0, [50.0, 50.0]);
+
+    // The network is purely resistive, so every frequency carries the same
+    // values; spot-check the first and last points.
+    for fi in [0, 9] {
+        assert_eq!(net.at(fi, 0, 0), Complex64::new(0.333333333, 0.0), "S11");
+        assert_eq!(net.at(fi, 1, 0), Complex64::new(-4.44444444, 0.0), "S21");
+        assert_eq!(net.at(fi, 0, 1), Complex64::new(0.0, 0.0), "S12");
+        assert_eq!(net.at(fi, 1, 1), Complex64::new(-0.333333333, 0.0), "S22");
+    }
+}
+
+/// The same file, but through `parse_file`, so extension sniffing and the
+/// lossy UTF-8 decode are exercised on real bytes rather than only on the
+/// hand-written fixtures above.
+#[test]
+fn a_real_ads_export_parses_from_disk() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/ads_unilateral_2port_ri.s2p");
+    let net = parse_file(&path).expect("should parse");
+    assert_eq!(net.nports, 2);
+    assert_eq!(net.nfreqs(), 10);
+}
+
+/// The full ADS export this fixture was derived from still carries its
+/// noise section, and this version must reject it by name rather than with
+/// a generic ordering error.
+#[test]
+fn the_full_ads_export_with_its_noise_section_is_rejected_by_name() {
+    const FULL: &str = include_str!("../../../tests/data/ads_unilateral_2port_ri_with_noise.s2p");
+    assert_eq!(kind(FULL), ParseErrorKind::NoiseSectionUnsupported);
 }
