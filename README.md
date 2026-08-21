@@ -13,20 +13,25 @@ to Python as NumPy arrays without copying.
 It is an I/O layer, not an analysis tool: read fast here, analyze in
 [scikit-rf](https://scikit-rf.org/). No network math, no plotting.
 
-> **Status: early scaffold.** The API surface below is in place; the parser
-> itself is under construction. Nothing is published to PyPI yet.
+> **Status: early development.** `ts.read()` works today for Touchstone 1.0,
+> 2-port files in `RI` format. Other formats, port counts, and noise
+> sections are next. Nothing is published to PyPI yet.
 
-## Planned API
+## API
 
 ```python
 import touchstone_rs as ts
 
-net = ts.read("filter.s2p")
+net = ts.read("filter.s2p")   # v1.0, 2-port, RI, today
 net.f        # np.float64, shape (F,)      — frequencies, always Hz
 net.s        # np.complex128, shape (F, N, N)
 net.z0       # np.float64, shape (N,)      — per-port reference impedance
 net.noise    # NoiseData | None            — noise parameters, if present
+```
 
+Planned:
+
+```python
 ts.write("out.s2p", net, format="MA")      # round-trip, any format
 ```
 
@@ -35,7 +40,7 @@ ts.write("out.s2p", net, format="MA")      # round-trip, any format
 | Milestone | Status |
 |---|---|
 | Project scaffold: workspace, bindings, CI | done |
-| Touchstone 1.0, 2-port, RI format | — |
+| Touchstone 1.0, 2-port, RI format | done |
 | All formats (RI/MA/DB), all port counts | — |
 | Noise parameters | — |
 | Touchstone 2.0 | — |
@@ -58,9 +63,9 @@ Performance claims will appear here only as measured benchmark numbers.
   source style.
 - **One wheel per platform.** abi3 (`cp310-abi3`) wheels cover CPython
   3.10 through 3.14+ from a single build.
-- **Errors with line numbers**, and eventually strict/lenient parse modes —
-  Touchstone files in the wild are messy, and the parser is designed
-  around that fact.
+- **Errors with line numbers.** Touchstone files in the wild are messy, and
+  the parser is designed around that fact — strict by default today, with a
+  lenient mode planned for the files that need it.
 
 ## Development
 

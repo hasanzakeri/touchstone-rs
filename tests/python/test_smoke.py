@@ -1,4 +1,7 @@
-"""Smoke tests for the scaffold: module import, stub behavior, array types."""
+"""Smoke tests: module import, error type, array construction and validation.
+
+Reading files is covered in test_read_v1.py.
+"""
 
 import numpy as np
 import pytest
@@ -16,13 +19,6 @@ def test_error_is_valueerror_subclass():
 def test_read_missing_file_raises():
     with pytest.raises(ts.TouchstoneError, match="failed to read"):
         ts.read("does-not-exist.s2p")
-
-
-def test_read_is_stub_for_now(tmp_path):
-    path = tmp_path / "minimal.s2p"
-    path.write_text("# GHZ S RI R 50\n1.0 0 0 0 0 0 0 0 0\n")
-    with pytest.raises(ts.TouchstoneError, match="not implemented"):
-        ts.read(path)
 
 
 def test_network_from_arrays():

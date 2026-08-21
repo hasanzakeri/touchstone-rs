@@ -19,3 +19,5 @@ Decisions that shape this project, recorded at the point they were made.
 | [0001](0001-rust-core-with-python-bindings.md) | Rust core with Python bindings, positioned Python-first | Accepted |
 | [0002](0002-workspace-and-naming.md) | Workspace layout, naming, and toolchain | Accepted |
 | [0003](0003-normalized-data-model.md) | Normalized in-memory data model | Accepted |
+| [0004](0004-strict-parsing-with-explicit-tolerances.md) | Strict parsing, with explicit and named tolerances | Accepted |
+| [0005](0005-test-data-provenance-and-licensing.md) | Test data provenance and licensing | Accepted |

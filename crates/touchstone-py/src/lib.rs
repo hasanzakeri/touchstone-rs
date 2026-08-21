@@ -170,6 +170,11 @@ impl Network {
             Some(noise) => Some(Py::new(py, NoiseData::from_core(py, noise))?),
             None => None,
         };
+        // `net.metadata` (unit, format, resistance, option line, comments)
+        // is intentionally not surfaced here yet. Its only real consumer is
+        // the writer, which should design the Python shape (frozen pyclass
+        // vs. dict, tuple vs. list for comments) — that lands with the
+        // writer milestone rather than being guessed at now.
         Ok(Network {
             f: net.freq_hz.into_pyarray(py).unbind(),
             s: net.s.into_pyarray(py).reshape([nf, n, n])?.unbind(),
