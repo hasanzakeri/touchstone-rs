@@ -1,4 +1,4 @@
-"""Reading Touchstone v1, 2-port, RI files through the Python bindings.
+"""Reading Touchstone v1 files through the Python bindings.
 
 These tests exercise the *binding*, not the grammar: the Rust integration
 suite in crates/touchstone-core/tests/parse_v1.rs owns the spec matrix.
@@ -99,9 +99,51 @@ def test_parse_errors_carry_their_line_number(tmp_path: Path) -> None:
         ts.read(write(tmp_path, text))
 
 
-def test_an_unsupported_format_says_what_is_supported(tmp_path: Path) -> None:
-    with pytest.raises(ts.TouchstoneError, match="only ri is supported"):
-        ts.read(write(tmp_path, "# GHZ S MA R 50\n1.0 0 0 0 0 0 0 0 0\n"))
+def test_an_unsupported_parameter_says_what_is_supported(tmp_path: Path) -> None:
+    with pytest.raises(ts.TouchstoneError, match="only s-parameters are supported"):
+        ts.read(write(tmp_path, "# GHZ Y RI R 50\n1.0 0 0 0 0 0 0 0 0\n"))
+
+
+def test_a_multiport_file_crosses_into_numpy_with_the_right_shape(
+    tmp_path: Path,
+) -> None:
+    # A 4-port set spans four lines, and its first line holds nine tokens --
+    # the same shape as a complete 2-port line. The array shape is the proof
+    # that the port count survived the crossing, not just the parse.
+    text = "# GHZ S RI R 50\n"
+    for freq in (1.0, 2.0):
+        for row in range(4):
+            values = " ".join(f"{(row + 1) * 10 + col + 1} 0" for col in range(4))
+            prefix = f"{freq} " if row == 0 else ""
+            text += f"{prefix}{values}\n"
+    net = ts.read(write(tmp_path, text, name="coupler.s4p"))
+
+    assert net.nports == 4
+    assert net.s.shape == (2, 4, 4)
+    assert net.z0.shape == (4,)
+    # Row-major, so S(2,3) is 23 -- a transposed read would give 32.
+    assert net.s[0, 1, 2] == 23 + 0j
+    assert net.s[0, 2, 1] == 32 + 0j
+    assert repr(net) == "<Network 4-port, 2 frequency points>"
+
+
+def test_a_one_port_file_reads_as_a_one_by_one_matrix(tmp_path: Path) -> None:
+    net = ts.read(write(tmp_path, "# GHZ S MA R 50\n1.0 0.5 90\n", name="load.s1p"))
+    assert net.nports == 1
+    assert net.s.shape == (1, 1, 1)
+    assert net.s[0, 0, 0] == pytest.approx(0.5j)
+
+
+def test_db_and_ma_files_reach_numpy_as_complex_values(tmp_path: Path) -> None:
+    # The formats differ only on disk; what arrives is always complex128.
+    ma = ts.read(write(tmp_path, "# GHZ S MA R 50\n1.0  2 90  1 180  0.5 0  1 -90\n"))
+    db = ts.read(write(tmp_path, "# GHZ S DB R 50\n1.0  20 0  0 0  -20 0  -20 180\n"))
+
+    assert ma.s.dtype == np.complex128
+    assert db.s.dtype == np.complex128
+    assert ma.s[0, 0, 0] == pytest.approx(2j)
+    assert db.s[0, 0, 0] == pytest.approx(10 + 0j)
+    assert db.s[0, 0, 1] == pytest.approx(0.1 + 0j), "S12, the third pair"
 
 
 def test_a_noise_section_is_reported_as_such(tmp_path: Path) -> None:
