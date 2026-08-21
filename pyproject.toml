@@ -33,6 +33,7 @@ dev = [
     "pytest>=8",
     "pre-commit>=4",
     "pyright>=1.1.411",
+    "ruff>=0.16.4",
 ]
 
 [tool.maturin]
@@ -47,6 +48,13 @@ cache-keys = [
     { file = "crates/**/Cargo.toml" },
     { file = "crates/**/*.rs" },
 ]
+
+[tool.ruff]
+# ruff formats python blocks inside markdown as of 0.16, which would collapse
+# the column-aligned comments in the README's API example. Documentation is
+# not source; keeping it excluded also means a bare `ruff format` covers the
+# same files the pre-commit hooks pass in.
+extend-exclude = ["*.md"]
 
 [tool.pyright]
 include = ["python", "tests/python"]
