@@ -225,6 +225,16 @@ fn an_empty_or_dataless_file_is_an_error() {
     );
 }
 
+/// A header-only file's error must point at the option line itself, not an
+/// arbitrary line 1 — which would be actively wrong once the option line
+/// isn't the file's first line.
+#[test]
+fn a_dataless_file_points_at_the_option_line_not_line_one() {
+    let (line, kind) = fails("! preface\n! more preface\n# GHZ S RI R 50\n! trailing talk\n");
+    assert_eq!(line, 3, "the option line is on line 3, not line 1");
+    assert_eq!(kind, ParseErrorKind::UnexpectedData("no data lines".into()));
+}
+
 #[test]
 fn data_before_the_option_line_is_an_error_naming_its_line() {
     let (line, kind) = fails("1.0 0 0 0 0 0 0 0 0\n# GHZ S RI R 50\n");

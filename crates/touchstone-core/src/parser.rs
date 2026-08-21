@@ -22,6 +22,9 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
     let mut comments: Vec<String> = Vec::new();
     let mut options: Option<Options> = None;
     let mut option_line: Option<String> = None;
+    // Where the option line was found, so a header-only file can point at
+    // it instead of an arbitrary line 1.
+    let mut option_line_number: Option<usize> = None;
     let mut nports = opts.nports;
 
     let mut freq_hz: Vec<f64> = Vec::new();
@@ -50,6 +53,7 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
             if options.is_none() {
                 options = Some(parse_option_line(body, line.number)?);
                 option_line = Some(line.content.to_string());
+                option_line_number = Some(line.number);
             }
             continue;
         }
@@ -151,8 +155,9 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
         return Err(err(1, ParseErrorKind::MissingOptionLine));
     };
     if freq_hz.is_empty() {
+        let line = option_line_number.expect("set alongside `options`, checked just above");
         return Err(err(
-            1,
+            line,
             ParseErrorKind::UnexpectedData("no data lines".to_string()),
         ));
     }
