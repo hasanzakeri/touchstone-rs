@@ -13,16 +13,17 @@ to Python as NumPy arrays without copying.
 It is an I/O layer, not an analysis tool: read fast here, analyze in
 [scikit-rf](https://scikit-rf.org/). No network math, no plotting.
 
-> **Status: early development.** `ts.read()` works today for Touchstone 1.0,
-> 2-port files in `RI` format. Other formats, port counts, and noise
-> sections are next. Nothing is published to PyPI yet.
+> **Status: early development.** `ts.read()` works today for Touchstone 1.0
+> S-parameter files in every value format (`RI`/`MA`/`DB`) and at any port
+> count. Noise-parameter sections, the other parameter types, and Touchstone
+> 2.0 are next. Nothing is published to PyPI yet.
 
 ## API
 
 ```python
 import touchstone_rs as ts
 
-net = ts.read("filter.s2p")   # v1.0, 2-port, RI, today
+net = ts.read("coupler.s4p")  # v1.0, any port count, RI/MA/DB, today
 net.f        # np.float64, shape (F,)      — frequencies, always Hz
 net.s        # np.complex128, shape (F, N, N)
 net.z0       # np.float64, shape (N,)      — per-port reference impedance
@@ -41,7 +42,7 @@ ts.write("out.s2p", net, format="MA")      # round-trip, any format
 |---|---|
 | Project scaffold: workspace, bindings, CI | done |
 | Touchstone 1.0, 2-port, RI format | done |
-| All formats (RI/MA/DB), all port counts | — |
+| All formats (RI/MA/DB), all port counts | done |
 | Noise parameters | — |
 | Touchstone 2.0 | — |
 | Writer + round-trip property tests | — |
