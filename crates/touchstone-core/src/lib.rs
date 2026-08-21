@@ -159,14 +159,19 @@ mod tests {
 
     #[test]
     fn explicit_options_override_inference() {
-        // A 2-port line read as anything else fails the value-count check,
-        // which proves the stated count was the one used.
+        // Left to itself this line reads as a complete 2-port data set. Told
+        // to expect a 3-port, the parser must instead wait for 19 values and
+        // report the shortfall — which proves the stated count was the one
+        // used, not the inferred one.
         let input = "# GHZ S RI R 50\n1.0 0 0 0 0 0 0 0 0\n";
         let opts = ParseOptions::new().nports(3);
         assert!(matches!(
             parse_str_with(input, &opts),
             Err(Error::Parse {
-                kind: ParseErrorKind::UnsupportedPortCount(3),
+                kind: ParseErrorKind::WrongValueCount {
+                    expected: 19,
+                    found: 9
+                },
                 ..
             })
         ));

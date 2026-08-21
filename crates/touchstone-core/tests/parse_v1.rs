@@ -32,6 +32,17 @@ fn kind(input: &str) -> ParseErrorKind {
     fails(input).1
 }
 
+/// `MA` and `DB` go through `cos`/`sin` and `powf`, so a value that is exact
+/// on disk in one format is only near-exact in another. Comparisons that
+/// cross a format boundary use this; `RI` comparisons stay exact.
+fn assert_close(actual: Complex64, expected: Complex64, what: &str) {
+    let error = (actual - expected).l1_norm();
+    assert!(
+        error < 1e-9,
+        "{what}: expected {expected}, got {actual} (off by {error})"
+    );
+}
+
 // ---------------------------------------------------------------- happy path
 
 #[test]
@@ -205,6 +216,277 @@ fn an_explicit_port_count_agreeing_with_the_data_is_accepted() {
     assert_eq!(net.nports, 2);
 }
 
+// ------------------------------------------------ port counts and wrapping
+
+/// Index-encoded matrix entries: the real part of S(row, col) is
+/// `row*10 + col`, one-based, so a transposed or mis-framed read is visible
+/// at a glance instead of hiding behind plausible numbers.
+fn entry(row: usize, col: usize) -> f64 {
+    ((row + 1) * 10 + (col + 1)) as f64
+}
+
+/// Render an `n`-port file the way spec v1.1 §3 p9 prescribes: each matrix
+/// row starts a new line, no more than four pairs per line, and only the
+/// very first line of a data set carries the frequency.
+fn conformant_multiport(nports: usize, freqs: &[f64]) -> String {
+    let mut out = String::from("# GHZ S RI R 50\n");
+    for (fi, freq) in freqs.iter().enumerate() {
+        for row in 0..nports {
+            for (chunk, cols) in (0..nports).collect::<Vec<_>>().chunks(4).enumerate() {
+                let mut line = String::new();
+                if row == 0 && chunk == 0 {
+                    line.push_str(&freq.to_string());
+                }
+                for &col in cols {
+                    // Offset each frequency so a data set boundary that slips
+                    // by one point cannot go unnoticed.
+                    line.push_str(&format!(" {} 0", entry(row, col) + fi as f64 * 1000.0));
+                }
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+fn assert_matrix_is_row_major(net: &Network, freqs: usize) {
+    for fi in 0..freqs {
+        for row in 0..net.nports {
+            for col in 0..net.nports {
+                assert_eq!(
+                    net.at(fi, row, col),
+                    Complex64::new(entry(row, col) + fi as f64 * 1000.0, 0.0),
+                    "S({},{}) at frequency {fi}",
+                    row + 1,
+                    col + 1
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_one_port_file_reads_its_single_entry() {
+    let net = ok("# GHZ S RI R 50\n1.0 0.5 -0.25\n2.0 0.4 -0.3\n");
+    assert_eq!(net.nports, 1);
+    assert_eq!(net.nfreqs(), 2);
+    assert_eq!(net.z0, [50.0]);
+    assert_eq!(net.at(0, 0, 0), Complex64::new(0.5, -0.25));
+    assert_eq!(net.at(1, 0, 0), Complex64::new(0.4, -0.3));
+}
+
+/// **The N ≥ 3 ordering guard.** Spec v1.1 §3 p7–8 lays a 3-port out as
+/// `<freq> <N11> <N12> <N13>` / `<N21> <N22> <N23>` / `<N31> <N32> <N33>` —
+/// plain row-major, with none of the 2-port's 21-before-12 swap. Applying
+/// the 2-port rule here, or forgetting the 2-port rule there, transposes
+/// every matrix silently.
+#[test]
+fn a_three_port_set_is_row_major_across_its_wrapped_lines() {
+    let net = ok(&conformant_multiport(3, &[1.0, 2.0]));
+    assert_eq!(net.nports, 3);
+    assert_eq!(net.nfreqs(), 2);
+    assert_eq!(net.s.len(), 2 * 9);
+    assert_matrix_is_row_major(&net, 2);
+}
+
+/// A 4-port's first line holds nine tokens — byte-identical in shape to a
+/// *complete* 2-port data set. Nothing about that line alone distinguishes
+/// them; only running the set on to its full 33 values does.
+#[test]
+fn a_four_port_first_line_is_not_mistaken_for_a_whole_two_port_set() {
+    let net = ok(&conformant_multiport(4, &[1.0, 2.0, 3.0]));
+    assert_eq!(net.nports, 4, "nine tokens on line one, but a 4-port");
+    assert_eq!(net.nfreqs(), 3);
+    assert_matrix_is_row_major(&net, 3);
+}
+
+/// Above four ports a single matrix *row* no longer fits on a line either,
+/// so a data set contains lines that are neither its first nor a row start.
+/// This is the layout 3- and 4-port files never produce.
+#[test]
+fn an_eight_port_set_wraps_each_matrix_row_across_two_lines() {
+    let net = ok(&conformant_multiport(8, &[1.0, 2.0]));
+    assert_eq!(net.nports, 8);
+    assert_eq!(net.nfreqs(), 2);
+    assert_eq!(net.s.len(), 2 * 64);
+    assert_matrix_is_row_major(&net, 2);
+}
+
+/// Real exports separate frequency blocks with blank lines and hang a
+/// comment off the first line of each — Keysight's own 3-port example does
+/// both. Neither may disturb a data set in progress.
+#[test]
+fn blank_lines_and_row_comments_do_not_break_a_wrapped_set() {
+    let net = ok(concat!(
+        "# GHZ S RI R 50\n",
+        "1.0  11 0  12 0  13 0   ! frequency line 1\n",
+        "     21 0  22 0  23 0\n",
+        "     31 0  32 0  33 0\n",
+        "\n",
+        "2.0  1011 0  1012 0  1013 0   ! frequency line 2\n",
+        "\n",
+        "     1021 0  1022 0  1023 0\n",
+        "     1031 0  1032 0  1033 0\n",
+    ));
+    assert_eq!(net.nports, 3);
+    assert_matrix_is_row_major(&net, 2);
+}
+
+/// The tolerance this milestone buys. Spec v1.1 §3 p8 requires *exactly*
+/// three pairs per line for a 3-port, but files in the wild wrap however
+/// their generator felt like — so a data set is accumulated by token count
+/// and any wrapping whose totals come out right is accepted.
+#[test]
+fn a_set_wrapped_against_the_spec_still_reads_correctly() {
+    // Everything on one line, then the same data broken at arbitrary points.
+    let one_line = ok(concat!(
+        "# GHZ S RI R 50\n",
+        "1.0 11 0 12 0 13 0 21 0 22 0 23 0 31 0 32 0 33 0\n",
+    ));
+    let ragged = ok(concat!(
+        "# GHZ S RI R 50\n",
+        "1.0 11 0 12 0\n",
+        "13 0 21 0 22 0 23 0 31 0 32 0\n",
+        "33 0\n",
+    ));
+    assert_eq!(one_line.nports, 3);
+    assert_eq!(one_line.s, ragged.s);
+    assert_matrix_is_row_major(&one_line, 1);
+    assert_matrix_is_row_major(&ragged, 1);
+}
+
+/// A 2-port set split 5 + 4. M1 could not have read this, and its old
+/// value-count test asserted the failure; the same input is now valid, and
+/// must not be mistaken for the noise section (which also opens with five
+/// values).
+#[test]
+fn a_two_port_set_split_after_two_pairs_is_not_mistaken_for_noise() {
+    let net = ok(concat!(
+        "# GHZ S RI R 50\n",
+        "1.0  0.1 0.2  9.0 9.1\n",
+        "     0.01 0.02  0.3 0.4\n",
+    ));
+    assert_eq!(net.nports, 2);
+    assert_eq!(net.nfreqs(), 1);
+    assert_eq!(net.at(0, 1, 0), Complex64::new(9.0, 9.1), "S21");
+    assert_eq!(net.at(0, 0, 1), Complex64::new(0.01, 0.02), "S12");
+}
+
+/// Nothing in the format caps the port count — spec v1.1 §3 p4 says
+/// "the Touchstone format supports matrixes of unlimited size", against
+/// Keysight's documented 5–99 and the `touchstone` crate's 32.
+#[test]
+fn a_port_count_beyond_every_other_readers_ceiling_is_accepted() {
+    let net = ok(&conformant_multiport(33, &[1.0]));
+    assert_eq!(net.nports, 33);
+    assert_eq!(net.s.len(), 33 * 33);
+    assert_eq!(net.z0.len(), 33);
+    assert_matrix_is_row_major(&net, 1);
+}
+
+/// The port count from the filename wins over inference, and is what makes a
+/// truncated file report a shortfall rather than an unsolvable shape.
+#[test]
+fn the_extension_supplies_a_port_count_the_data_alone_could_not_fix() {
+    let dir = std::env::temp_dir().join("touchstone_rs_m2_extension");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("truncated.s4p");
+
+    // A 4-port set stopping one pair short: 31 values, not 33.
+    let full = conformant_multiport(4, &[1.0]);
+    let lines: Vec<&str> = full.trim_end().lines().collect();
+    let mut input = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i + 1 == lines.len() {
+            let mut tokens: Vec<&str> = line.split_whitespace().collect();
+            tokens.truncate(tokens.len() - 2);
+            input.push_str(&tokens.join(" "));
+        } else {
+            input.push_str(line);
+        }
+        input.push('\n');
+    }
+    std::fs::write(&path, &input).expect("write");
+
+    assert!(matches!(
+        parse_str(&input),
+        Err(Error::Parse {
+            kind: ParseErrorKind::IndeterminatePortCount { .. },
+            ..
+        })
+    ));
+    assert!(matches!(
+        parse_file(&path),
+        Err(Error::Parse {
+            kind: ParseErrorKind::WrongValueCount {
+                expected: 33,
+                found: 31
+            },
+            ..
+        })
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// --------------------------------------------------------------- formats
+
+#[test]
+fn magnitude_angle_files_convert_to_the_same_numbers_as_real_imaginary() {
+    // 2 @ 90 deg is 2i; 1 @ 180 deg is -1; 0.5 @ 0 deg is 0.5.
+    let net = ok("# GHZ S MA R 50\n1.0  2 90  1 180  0.5 0  1 -90\n");
+    assert_eq!(net.metadata.format, Format::Ma);
+    assert_close(net.at(0, 0, 0), Complex64::new(0.0, 2.0), "S11");
+    assert_close(net.at(0, 1, 0), Complex64::new(-1.0, 0.0), "S21");
+    assert_close(net.at(0, 0, 1), Complex64::new(0.5, 0.0), "S12");
+    assert_close(net.at(0, 1, 1), Complex64::new(0.0, -1.0), "S22");
+}
+
+#[test]
+fn db_files_use_twenty_log_ten_not_ten() {
+    // 20 dB is a magnitude of 10, 0 dB is 1, -20 dB is 0.1.
+    let net = ok("# GHZ S DB R 50\n1.0  20 0  0 0  -20 0  -20 180\n");
+    assert_eq!(net.metadata.format, Format::Db);
+    assert_close(net.at(0, 0, 0), Complex64::new(10.0, 0.0), "S11");
+    assert_close(net.at(0, 1, 0), Complex64::new(1.0, 0.0), "S21");
+    assert_close(net.at(0, 0, 1), Complex64::new(0.1, 0.0), "S12");
+    assert_close(net.at(0, 1, 1), Complex64::new(-0.1, 0.0), "S22");
+}
+
+/// A bare `#` means `GHz S MA R 50` (spec v1.1 §3), and MA is now readable —
+/// so the minimum legal option line finally parses a file on its own.
+#[test]
+fn the_minimum_legal_option_line_parses_a_whole_file() {
+    let net = ok("#\n1.0  1 0  1 0  1 0  1 0\n");
+    assert_eq!(net.metadata.format, Format::Ma);
+    assert_eq!(net.metadata.freq_unit, FreqUnit::GHz);
+    assert_eq!(net.freq_hz, [1e9]);
+    assert_close(net.at(0, 0, 0), Complex64::new(1.0, 0.0), "S11");
+}
+
+/// The 2-port swap is a property of the file layout, not of the value
+/// format, so it has to survive the polar conversions too.
+#[test]
+fn the_two_port_swap_applies_in_every_format() {
+    let ri = ok("# GHZ S RI R 50\n1.0  1 0  2 0  3 0  4 0\n");
+    let ma = ok("# GHZ S MA R 50\n1.0  1 0  2 0  3 0  4 0\n");
+    let db = ok(
+        "# GHZ S DB R 50\n1.0  0 0  6.020599913279624 0  9.542425094393249 0  12.041199826559248 0\n",
+    );
+    for net in [&ri, &ma, &db] {
+        assert_close(
+            net.at(0, 1, 0),
+            Complex64::new(2.0, 0.0),
+            "S21 is the 2nd pair",
+        );
+        assert_close(
+            net.at(0, 0, 1),
+            Complex64::new(3.0, 0.0),
+            "S12 is the 3rd pair",
+        );
+    }
+}
+
 // ---------------------------------------------------------------- error path
 
 #[test]
@@ -262,11 +544,19 @@ fn frequencies_must_strictly_increase() {
     assert!(matches!(kind, ParseErrorKind::FrequencyNotAscending { .. }));
 }
 
+/// With the port count known, a malformed data set is reported against the
+/// size that count implies.
 #[test]
 fn a_wrong_value_count_reports_what_was_expected() {
+    let two_port = ParseOptions::new().nports(2);
+    let kind_of = |input: &str| match parse_str_with(input, &two_port) {
+        Err(Error::Parse { kind, .. }) => kind,
+        other => panic!("expected a parse error, got {other:?}"),
+    };
+
     // Truncated.
     assert_eq!(
-        kind("# GHZ S RI R 50\n1.0 0 0 0 0 0 0 0\n"),
+        kind_of("# GHZ S RI R 50\n1.0 0 0 0 0 0 0 0\n"),
         ParseErrorKind::WrongValueCount {
             expected: 9,
             found: 8,
@@ -274,20 +564,40 @@ fn a_wrong_value_count_reports_what_was_expected() {
     );
     // Trailing extra value.
     assert_eq!(
-        kind("# GHZ S RI R 50\n1.0 0 0 0 0 0 0 0 0 0\n"),
+        kind_of("# GHZ S RI R 50\n1.0 0 0 0 0 0 0 0 0 0\n"),
         ParseErrorKind::WrongValueCount {
             expected: 9,
             found: 10,
         }
     );
-    // A wrapped 2-port line: unsupported in this version, and reported as
-    // the value-count mismatch it is.
+    // A data set left short at end of file, spread over two lines.
     assert_eq!(
-        kind("# GHZ S RI R 50\n1.0 0 0 0 0\n0 0 0 0\n"),
+        kind_of("# GHZ S RI R 50\n1.0 0 0 0 0\n0 0\n"),
         ParseErrorKind::WrongValueCount {
             expected: 9,
-            found: 5,
+            found: 7,
         }
+    );
+}
+
+/// Without a port count from the caller or the filename, a malformed first
+/// data set cannot be measured against anything — there is no `n` for which
+/// its size is legal. Saying so, and naming the two ways to supply the count,
+/// beats inventing an expectation the file never claimed.
+#[test]
+fn an_unmeasurable_first_data_set_reports_the_shape_it_could_not_solve() {
+    assert_eq!(
+        kind("# GHZ S RI R 50\n1.0 0 0 0 0 0 0 0\n"),
+        ParseErrorKind::IndeterminatePortCount { found: 8 }
+    );
+    assert_eq!(
+        kind("# GHZ S RI R 50\n1.0 0 0 0 0 0 0 0 0 0\n"),
+        ParseErrorKind::IndeterminatePortCount { found: 10 }
+    );
+    // Odd, but two entries is not a square matrix.
+    assert_eq!(
+        kind("# GHZ S RI R 50\n1.0 0 0 0 0\n"),
+        ParseErrorKind::IndeterminatePortCount { found: 5 }
     );
 }
 
@@ -299,33 +609,20 @@ fn a_garbage_token_is_quoted_back() {
 }
 
 #[test]
-fn out_of_scope_formats_and_parameters_name_the_limit() {
-    assert_eq!(
-        kind("# GHZ S MA R 50\n1.0 0 0 0 0 0 0 0 0\n"),
-        ParseErrorKind::UnsupportedFormat(Format::Ma)
-    );
-    assert_eq!(
-        kind("# GHZ S DB R 50\n1.0 0 0 0 0 0 0 0 0\n"),
-        ParseErrorKind::UnsupportedFormat(Format::Db)
-    );
-    assert_eq!(
-        kind("# GHZ Y RI R 50\n1.0 0 0 0 0 0 0 0 0\n"),
-        ParseErrorKind::UnsupportedParameter(Parameter::Y)
-    );
-
-    // A bare `#` defaults to MA, so it must not be mistaken for RI.
-    assert_eq!(
-        kind("#\n1.0 0 0 0 0 0 0 0 0\n"),
-        ParseErrorKind::UnsupportedFormat(Format::Ma)
-    );
-}
-
-#[test]
-fn a_one_port_file_reports_an_unsupported_port_count() {
-    assert_eq!(
-        kind("# GHZ S RI R 50\n1.0 0.5 0.5\n"),
-        ParseErrorKind::UnsupportedPortCount(1)
-    );
+fn out_of_scope_parameters_name_the_limit() {
+    for (param, expected) in [
+        ("Y", Parameter::Y),
+        ("Z", Parameter::Z),
+        ("G", Parameter::G),
+        ("H", Parameter::H),
+    ] {
+        let input = format!("# GHZ {param} RI R 50\n1.0 0 0 0 0 0 0 0 0\n");
+        assert_eq!(
+            kind(&input),
+            ParseErrorKind::UnsupportedParameter(expected),
+            "parameter {param}"
+        );
+    }
 }
 
 /// The noise section must announce itself. Every real 2-port amplifier file
@@ -370,34 +667,58 @@ fn a_five_value_line_that_keeps_ascending_is_not_mistaken_for_noise() {
     );
 }
 
+/// Rust's `f64` parser accepts "nan" and "inf" as tokens. Whether that is a
+/// problem depends on what the value *converts to*, not on how it is spelled
+/// — which is the whole reason the check moved downstream of the conversion.
 #[test]
-fn nan_and_infinite_values_are_rejected_like_any_other_bad_token() {
-    // Rust's f64 parser accepts "nan"/"inf" as valid tokens; neither is a
-    // usable network value, and letting one through would be exactly the
-    // plausible-looking wrong data ADR 0004 argues against.
-    assert_eq!(
+fn values_that_stay_non_finite_after_conversion_are_rejected() {
+    assert!(matches!(
         kind("# GHZ S RI R 50\n1.0 nan 0 0 0 0 0 0 0\n"),
-        ParseErrorKind::InvalidNumber("nan".into())
-    );
-    assert_eq!(
+        ParseErrorKind::NonFiniteValue { .. }
+    ));
+    assert!(matches!(
         kind("# GHZ S RI R 50\n1.0 0 inf 0 0 0 0 0 0\n"),
-        ParseErrorKind::InvalidNumber("inf".into())
-    );
+        ParseErrorKind::NonFiniteValue { .. }
+    ));
+    // An infinite *magnitude* is still infinite in every format.
+    assert!(matches!(
+        kind("# GHZ S MA R 50\n1.0 inf 0 0 0 0 0 0 0\n"),
+        ParseErrorKind::NonFiniteValue { .. }
+    ));
+    assert!(matches!(
+        kind("# GHZ S DB R 50\n1.0 inf 0 0 0 0 0 0 0\n"),
+        ParseErrorKind::NonFiniteValue { .. }
+    ));
+    // A frequency is not a converted pair, so it is still caught as the bad
+    // token it is.
     assert_eq!(
         kind("# GHZ S RI R 50\ninf 0 0 0 0 0 0 0 0\n"),
         ParseErrorKind::InvalidNumber("inf".into())
     );
 }
 
+/// The counterpart: `-inf` in a `DB` magnitude column is not a bad token at
+/// all. It is how a real ADS export writes an entry whose magnitude is
+/// exactly zero, and `10^(-inf/20)` is `0`. Rejecting it would make the
+/// committed DB fixture unreadable.
 #[test]
-fn the_unsupported_format_message_reads_as_a_scope_limit() {
-    // This is the first error most new users will see, so its wording is
-    // pinned, not just its variant. Reported at the option line (line 1),
-    // since the format is a property of the option line, not the data row.
-    let err = parse_str("# GHZ S MA R 50\n1.0 0 0 0 0 0 0 0 0\n").unwrap_err();
+fn minus_infinity_db_reads_as_an_exact_zero() {
+    let net = ok("# GHZ S DB R 50\n1.0 0 0 0 0 -inf 0 0 0\n");
+    assert_eq!(net.at(0, 0, 1), Complex64::new(0.0, 0.0), "S12");
+    // 0 dB is unity, so the entries around it are unaffected.
+    assert_eq!(net.at(0, 0, 0), Complex64::new(1.0, 0.0), "S11");
+}
+
+#[test]
+fn the_unsupported_parameter_message_reads_as_a_scope_limit() {
+    // The wording is pinned, not just the variant: this is the error a user
+    // pointing us at a Y-parameter file sees. Reported at the option line
+    // (line 1), since the parameter is a property of the option line, not of
+    // any data row.
+    let err = parse_str("# GHZ Y RI R 50\n1.0 0 0 0 0 0 0 0 0\n").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "line 1: unsupported format ma: only ri is supported in this version"
+        "line 1: unsupported parameter y: only s-parameters are supported in this version"
     );
 }
 
@@ -405,10 +726,10 @@ fn the_unsupported_format_message_reads_as_a_scope_limit() {
 /// lines at all — a better diagnosis than "no data lines", which would be
 /// true but useless: the file wouldn't parse even if it had data.
 #[test]
-fn an_out_of_scope_format_is_reported_even_without_any_data() {
+fn an_out_of_scope_parameter_is_reported_even_without_any_data() {
     assert_eq!(
-        kind("# GHZ S MA R 50\n"),
-        ParseErrorKind::UnsupportedFormat(Format::Ma)
+        kind("# GHZ Z RI R 50\n"),
+        ParseErrorKind::UnsupportedParameter(Parameter::Z)
     );
 }
 
@@ -481,4 +802,64 @@ fn a_real_ads_export_parses_from_disk() {
 fn the_full_ads_export_with_its_noise_section_is_rejected_by_name() {
     const FULL: &str = include_str!("../../../tests/data/ads_unilateral_2port_ri_with_noise.s2p");
     assert_eq!(kind(FULL), ParseErrorKind::NoiseSectionUnsupported);
+}
+
+/// The same device, exported by ADS in all three formats. **This is the
+/// strongest correctness check in the suite**: it needs no hand-computed
+/// expectations, and a wrong dB base, a degrees/radians slip, or a sign
+/// error in the angle all break it immediately. The `DB` file's S12 column
+/// is literally `-inf`, so it also proves the zero-magnitude case survives a
+/// round trip through the conversion.
+#[test]
+fn the_three_ads_exports_of_one_device_agree() {
+    const MA: &str = include_str!("../../../tests/data/ads_unilateral_2port_ma.s2p");
+    const DB: &str = include_str!("../../../tests/data/ads_unilateral_2port_db.s2p");
+
+    let ri = ok(REAL_FILE);
+    let ma = ok(MA);
+    let db = ok(DB);
+
+    assert_eq!(ma.metadata.format, Format::Ma);
+    assert_eq!(db.metadata.format, Format::Db);
+
+    for other in [&ma, &db] {
+        assert_eq!(other.nports, ri.nports);
+        assert_eq!(other.freq_hz, ri.freq_hz);
+        assert_eq!(other.z0, ri.z0);
+    }
+
+    for fi in 0..ri.nfreqs() {
+        for (row, col) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            let expected = ri.at(fi, row, col);
+            // The exports carry nine significant figures, so agreement is
+            // limited by the file's own precision, not by the conversion.
+            for (name, other) in [("ma", &ma), ("db", &db)] {
+                let actual = other.at(fi, row, col);
+                let error = (actual - expected).l1_norm();
+                assert!(
+                    error < 1e-7,
+                    "{name} S({},{}) at point {fi}: expected {expected}, got {actual}",
+                    row + 1,
+                    col + 1
+                );
+            }
+        }
+    }
+
+    // The device is unilateral: S12 is a true zero, written `-inf` dB.
+    assert_eq!(db.at(0, 0, 1).l1_norm(), 0.0, "S12 from -inf dB");
+}
+
+/// The QUCS export of the same device: no `!` header at all, verbose
+/// `e+009` exponents, and a blank line before a noise-shaped tail with no
+/// `! Noise params` label. Its S-data half is M2's business — reaching the
+/// noise boundary and naming it proves every layout quirk before that point
+/// was handled, since anything else would have failed earlier and
+/// differently. Parsing the tail is M3's job.
+#[test]
+fn the_qucs_export_parses_its_layout_quirks_and_stops_at_the_noise_tail() {
+    const QUCS: &str = include_str!("../../../tests/data/qucs_unilateral_2port_ri_with_noise.s2p");
+    let (line, kind) = fails(QUCS);
+    assert_eq!(kind, ParseErrorKind::NoiseSectionUnsupported);
+    assert_eq!(line, 13, "the first line of the unlabelled noise tail");
 }
