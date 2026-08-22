@@ -54,6 +54,25 @@ pub(crate) fn has_cr_only_line_endings(input: &str) -> bool {
     input.contains('\r') && !input.contains('\n')
 }
 
+/// `input` with a trailing DOS end-of-file marker removed.
+///
+/// A lone `0x1A` (Ctrl-Z, ASCII SUB) at the end of a text file is the CP/M
+/// and MS-DOS end-of-file convention, and tools of that era emit one —
+/// vendor transistor files from the early 1990s end with exactly this, right
+/// after their noise section. The byte carries no data — it *is* the end of
+/// the data — but `split_whitespace` does not treat it as whitespace, so left
+/// in place it arrives as a token that cannot be a number and that is
+/// invisible when quoted back at the reader.
+///
+/// Only a *trailing* marker is stripped, along with the whitespace around it.
+/// A `0x1A` anywhere else stays an error: truncating a file at the first one,
+/// as DOS itself did, could silently discard real data — the outcome ADR 0004
+/// weighs everything against.
+pub(crate) fn without_trailing_eof_marker(input: &str) -> &str {
+    let trimmed = input.trim_end();
+    trimmed.strip_suffix('\u{1a}').unwrap_or(input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +143,37 @@ mod tests {
     #[test]
     fn empty_input_yields_nothing() {
         assert_eq!(parts(""), []);
+    }
+
+    #[test]
+    fn a_trailing_dos_eof_marker_is_not_part_of_the_file() {
+        // How a DOS-era export ends: CRLF, the marker, CRLF.
+        assert_eq!(
+            without_trailing_eof_marker("1 0 0\r\n\u{1a}\r\n"),
+            "1 0 0\r\n"
+        );
+        assert_eq!(without_trailing_eof_marker("1 0 0\n\u{1a}"), "1 0 0\n");
+        // The marker on the same line as the last value, and with no
+        // whitespace at all after it.
+        assert_eq!(without_trailing_eof_marker("1 0 0\u{1a}"), "1 0 0");
+    }
+
+    /// Only the trailing marker goes. Truncating at the first one — what DOS
+    /// itself did — would silently drop whatever followed, and data quietly
+    /// lost is the outcome this parser is built to avoid.
+    #[test]
+    fn a_marker_in_the_middle_is_left_where_it_is() {
+        let input = "1 0 0\n\u{1a}\n2 0 0\n";
+        assert_eq!(without_trailing_eof_marker(input), input);
+    }
+
+    #[test]
+    fn input_without_a_marker_is_returned_untouched() {
+        // Not even the trailing newline is trimmed, so line numbering and
+        // every other behaviour are exactly as they were.
+        for input in ["1 0 0\n", "1 0 0", "", "   \n"] {
+            assert_eq!(without_trailing_eof_marker(input), input, "{input:?}");
+        }
     }
 
     #[test]

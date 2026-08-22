@@ -14,9 +14,10 @@ It is an I/O layer, not an analysis tool: read fast here, analyze in
 [scikit-rf](https://scikit-rf.org/). No network math, no plotting.
 
 > **Status: early development.** `ts.read()` works today for Touchstone 1.0
-> S-parameter files in every value format (`RI`/`MA`/`DB`) and at any port
-> count. Noise-parameter sections, the other parameter types, and Touchstone
-> 2.0 are next. Nothing is published to PyPI yet.
+> S-parameter files in every value format (`RI`/`MA`/`DB`), at any port
+> count, including the noise-parameter section a 2-port file may carry. The
+> other parameter types and Touchstone 2.0 are next. Nothing is published to
+> PyPI yet.
 
 ## API
 
@@ -28,7 +29,18 @@ net.f        # np.float64, shape (F,)      — frequencies, always Hz
 net.s        # np.complex128, shape (F, N, N)
 net.z0       # np.float64, shape (N,)      — per-port reference impedance
 net.noise    # NoiseData | None            — noise parameters, if present
+
+amp = ts.read("lna.s2p")
+amp.noise.f          # np.float64, shape (M,)   — Hz; M need not equal F
+amp.noise.nfmin_db   # np.float64, shape (M,)   — minimum noise figure, dB
+amp.noise.gamma_opt  # np.complex128, shape (M,)
+amp.noise.rn         # np.float64, shape (M,)   — normalized to z0, as written
 ```
+
+Noise sections are found the way the format demands — by the frequency
+stepping back into the sweep already covered — so files that carry no comment
+to announce one still read. See
+[ADR 0007](docs/adr/0007-noise-parameter-section.md).
 
 Planned:
 
@@ -43,7 +55,7 @@ ts.write("out.s2p", net, format="MA")      # round-trip, any format
 | Project scaffold: workspace, bindings, CI | done |
 | Touchstone 1.0, 2-port, RI format | done |
 | All formats (RI/MA/DB), all port counts | done |
-| Noise parameters | — |
+| Noise parameters | done |
 | Touchstone 2.0 | — |
 | Writer + round-trip property tests | — |
 | Fuzzing, strict/lenient modes | — |

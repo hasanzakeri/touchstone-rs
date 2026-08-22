@@ -16,8 +16,8 @@
 use std::path::Path;
 
 use touchstone_core::{
-    Complex64, Error, Format, FreqUnit, Network, Parameter, ParseErrorKind, ParseOptions, Version,
-    parse_file, parse_str, parse_str_with,
+    Complex64, Error, Format, FreqUnit, Network, NoiseData, Parameter, ParseErrorKind,
+    ParseOptions, Version, parse_file, parse_str, parse_str_with,
 };
 
 /// The smallest file this version accepts.
@@ -100,10 +100,11 @@ fn reads_a_minimal_two_port_file() {
 
 /// **The ordering guard.** Spec v1.1 §3 writes a 2-port line as
 /// S11 S21 S12 S22 — 21 *before* 12. A swap here silently transposes every
-/// matrix, and no real passive file can detect it: a reciprocal network has
-/// S21 == S12, which is why the full-length Murata-style fixtures cannot
-/// stand in for this test. The values below are deliberately far apart, the
-/// way a unilateral amplifier's are.
+/// matrix, and no passive device's data can detect it: a reciprocal network
+/// has S21 == S12, so a transposed read of a filter or a capacitor is
+/// indistinguishable from a correct one however many points it has. The
+/// values below are deliberately far apart, the way a unilateral amplifier's
+/// are.
 #[test]
 fn two_port_data_is_ordered_s11_s21_s12_s22() {
     let net = ok("# GHZ S RI R 50\n1.0  0.1 0.2  9.0 9.1  0.01 0.02  0.3 0.4\n");
@@ -593,6 +594,430 @@ fn the_two_port_swap_applies_in_every_format() {
     }
 }
 
+// ----------------------------------------------------------- noise parameters
+
+/// Built to the shape of spec v1.1 §3 p11's own worked example (Example 8),
+/// with values of our own — the ADR conventions keep spec text out of this
+/// repository, and it is the shape that carries the meaning anyway.
+///
+/// The whole feature in six lines: two S-parameter points spanning 2–22 GHz,
+/// then two noise points at 4 and 18 GHz — *inside* the sweep that was just
+/// covered. That step back is the only thing marking the boundary. The
+/// `! NOISE PARAMETERS` line is a comment like any other and the parser never
+/// reads it, which is what makes the unlabelled QUCS export below work.
+const NOISY_TWO_PORT: &str = concat!(
+    "!2-port network, S-parameter and noise data\n",
+    "# GHZ S MA R 50\n",
+    "2 .9 -25 3.5 155 .05 75 .65 -15\n",
+    "22 .6 -145 1.3 40 .15 40 .55 -85\n",
+    "! NOISE PARAMETERS\n",
+    "4 .75 .62 61 .35\n",
+    "18 2.55 .44 -37 .42\n",
+);
+
+/// The noise rows of [`NOISY_TWO_PORT`], reused under other option lines.
+const NOISE_ROWS: &str = concat!("4 .75 .62 61 .35\n", "18 2.55 .44 -37 .42\n");
+
+fn noise_of(input: &str) -> NoiseData {
+    ok(input).noise.expect("should have a noise section")
+}
+
+#[test]
+fn a_file_with_both_sections_reads_both_of_them() {
+    let net = ok(NOISY_TWO_PORT);
+
+    // The S-data is unaffected by what follows it.
+    assert_eq!(net.nports, 2);
+    assert_eq!(net.freq_hz, [2e9, 22e9]);
+    assert_eq!(net.nfreqs(), 2, "the noise rows are not extra S points");
+
+    let noise = net.noise.expect("the file has a noise section");
+    assert_eq!(
+        noise.freq_hz,
+        [4e9, 18e9],
+        "noise frequencies normalize to Hz like any other"
+    );
+    assert_eq!(noise.nfmin_db, [0.75, 2.55]);
+    // `.62 <61` and `.44 <-37`, per p10's "(MA)" — see the test below.
+    // Written to ten figures, which is far inside `assert_close`'s 1e-9:
+    // these are expectations, not a claim about the last bit.
+    assert_close(
+        noise.gamma_opt[0],
+        Complex64::new(0.300_581_964_6, 0.542_264_218_4),
+        "gamma_opt at 4 GHz",
+    );
+    assert_close(
+        noise.gamma_opt[1],
+        Complex64::new(0.351_399_624_4, -0.264_798_610_2),
+        "gamma_opt at 18 GHz",
+    );
+}
+
+/// **Γopt is magnitude-and-angle in every file.** Spec v1.1 §3 p10 marks the
+/// third and fourth noise entries "(MA)" flatly, so — unlike the network data
+/// — they do not follow the option line's format. Reading `.62 61` as
+/// real/imaginary in an `RI` file would give `0.62 + 61i`: two orders of
+/// magnitude out, and silent.
+///
+/// The three real ADS exports prove the same thing from the other direction
+/// (see `the_three_ads_exports_agree_on_their_noise_section`); this pins it
+/// on values whose polar reading is unmistakable.
+#[test]
+fn gamma_opt_is_magnitude_and_angle_whatever_the_option_line_says() {
+    let with_format = |format: &str| {
+        // The S-data means something different in each format, which is fine
+        // — it is the noise rows, byte-identical across the three, that are
+        // under test.
+        noise_of(&format!(
+            "# GHZ S {format} R 50\n\
+             2 .5 10 .5 10 .5 10 .5 10\n\
+             22 .5 10 .5 10 .5 10 .5 10\n\
+             {NOISE_ROWS}"
+        ))
+    };
+    let (ri, ma, db) = (with_format("RI"), with_format("MA"), with_format("DB"));
+
+    // Exactly equal, not merely close: the noise path never consults the
+    // format, so the three runs are the same arithmetic on the same tokens.
+    assert_eq!(ri, ma, "RI and MA must read the noise section identically");
+    assert_eq!(ri, db, "RI and DB must read the noise section identically");
+
+    // And it really is polar, rather than the RI file's numbers taken as-is.
+    assert_close(
+        ri.gamma_opt[0],
+        Complex64::new(0.300_581_964_6, 0.542_264_218_4),
+        "gamma_opt from an RI file",
+    );
+}
+
+/// `Rn` is stored as the file writes it — normalized to the option line's
+/// `R`, which is what spec v1.1 §3 p11 says both it and Γopt are given
+/// against — and not converted to ohms. With `R 50` on the option line a
+/// denormalizing reader would report 17.5 and 21 here.
+///
+/// This is an API promise, not an oversight: `z0` is on the same `Network`
+/// for anyone who wants ohms, and the writer needs the on-disk value back.
+#[test]
+fn rn_is_kept_normalized_the_way_the_file_writes_it() {
+    let noise = noise_of(NOISY_TWO_PORT);
+    assert_eq!(noise.rn, [0.35, 0.42]);
+}
+
+/// **The `<=` boundary.** Spec p10 says the first noise frequency is *less
+/// than* the last S-parameter frequency; p11 says the lowest is *less than or
+/// equal to* the highest. A noise sweep starting exactly at the S-sweep's
+/// last frequency is legal under p11 and invisible under p10 — and the ADS
+/// exports restart theirs inside the S span, so `<=` is the reading that
+/// reads real files. See ADR 0007.
+///
+/// Also pins the other half of the rule: only the *first* noise frequency is
+/// bounded by the S-sweep. The rest are free to run past its top, as the
+/// second row here does.
+#[test]
+fn a_noise_sweep_may_begin_at_the_last_s_parameter_frequency() {
+    let noise = noise_of(concat!(
+        "# GHZ S RI R 50\n",
+        "1.0 0 0 0 0 0 0 0 0\n",
+        "2.0 0 0 0 0 0 0 0 0\n",
+        "2.0 0.7 0.5 45 0.1\n",
+        "3.0 0.8 0.4 30 0.2\n",
+    ));
+    assert_eq!(noise.freq_hz, [2e9, 3e9]);
+}
+
+/// A section of one row has no following line to close it, so only the
+/// end-of-file flush can emit it. Real files do this: a vendor transistor
+/// file may carry two noise rows against twenty-odd S-parameter points.
+#[test]
+fn a_single_noise_row_is_read_at_end_of_file() {
+    let noise = noise_of(concat!(
+        "# GHZ S RI R 50\n",
+        "1.0 0 0 0 0 0 0 0 0\n",
+        "2.0 0 0 0 0 0 0 0 0\n",
+        "1.5 0.7 0.5 45 0.1\n",
+    ));
+    assert_eq!(noise.freq_hz, [1.5e9]);
+    assert_eq!(noise.nfmin_db, [0.7]);
+    assert_eq!(noise.rn, [0.1]);
+}
+
+/// Spec v1.1 §3 p11 states outright that the two sets of frequencies need not
+/// match, and vendor files routinely measure noise at a handful of points
+/// against hundreds of S-parameter ones — two against twenty-odd is a
+/// perfectly ordinary shape. The arrays differ in length and in grid, and
+/// nothing may assume otherwise.
+#[test]
+fn the_noise_grid_need_not_match_the_s_grid() {
+    let net = ok(concat!(
+        "# GHZ S RI R 50\n",
+        "1.0 0 0 0 0 0 0 0 0\n",
+        "2.0 0 0 0 0 0 0 0 0\n",
+        "3.0 0 0 0 0 0 0 0 0\n",
+        "4.0 0 0 0 0 0 0 0 0\n",
+        "5.0 0 0 0 0 0 0 0 0\n",
+        "1.5 0.7 0.5 45 0.1\n",
+        "3.5 0.9 0.4 -60 0.2\n",
+    ));
+    assert_eq!(net.nfreqs(), 5);
+    let noise = net.noise.expect("a noise section");
+    assert_eq!(noise.freq_hz, [1.5e9, 3.5e9]);
+    assert_eq!(noise.freq_hz.len(), 2);
+}
+
+/// Nothing in the noise section is range-checked. `|Γopt|` above 1 is
+/// unphysical, and Keysight's own documented example writes it *negative*
+/// (a magnitude of `-0.1211`, which is simply the phase turned around);
+/// the spec describes clamping `Rn` as something "a simulator may" do, not
+/// something a reader does. This is an I/O layer: it reports the file.
+#[test]
+fn unphysical_noise_values_are_reported_not_rejected() {
+    let noise = noise_of(concat!(
+        "# GHZ S RI R 50\n",
+        "1.0 0 0 0 0 0 0 0 0\n",
+        "2.0 0 0 0 0 0 0 0 0\n",
+        "1.0 2.0 -0.1211 -0.0003 .4\n",
+        "2.0 2.5 1.9 0 -0.5\n",
+    ));
+    assert_close(
+        noise.gamma_opt[0],
+        Complex64::new(-0.121_099_999_999_999_99, 6.339_986_264_000_35e-7),
+        "a negative magnitude is a phase flip, not an error",
+    );
+    assert_close(
+        noise.gamma_opt[1],
+        Complex64::new(1.9, 0.0),
+        "|gamma| > 1 is passed through",
+    );
+    assert_eq!(noise.rn, [0.4, -0.5], "a negative rn is passed through");
+}
+
+// The negative paths. A noise section is found by inference, so every one of
+// these has to say *noise* — a reader who is told "frequencies must increase"
+// on a line they believe is S-data cannot tell whether the parser simply
+// found the boundary in the wrong place.
+
+/// A 5-value tail whose frequency keeps *ascending* is not a noise section:
+/// spec p11 bounds the lowest noise frequency by the highest S one, and that
+/// bound is the entire boundary rule. Such a file is malformed some other
+/// way, and gets the accurate value-count message rather than a guess.
+///
+/// Dropping the frequency comparison would misclassify a legitimate 2-port
+/// set wrapped as 5 + 4 (ADR 0006) as a noise section, and silently discard
+/// half of it.
+#[test]
+fn a_five_value_line_that_keeps_ascending_is_not_mistaken_for_noise() {
+    assert_eq!(
+        kind("# GHZ S RI R 50\n1.0 0 0 0 0 0 0 0 0\n2.0 0 0 0 0\n"),
+        ParseErrorKind::WrongValueCount {
+            expected: 9,
+            found: 5,
+        }
+    );
+}
+
+/// Spec v1.1 §3: noise parameters "can only be included in 2-port network
+/// descriptions". A 5-value tail anywhere else is malformed data, and gets
+/// the ordinary value-count message.
+#[test]
+fn noise_is_looked_for_only_in_two_port_files() {
+    // 1-port: a set is 3 values, so 5 is simply the wrong count.
+    assert_eq!(
+        kind("# GHZ S RI R 50\n1.0 0.1 0.2\n2.0 0.1 0.2\n1.0 0.7 0.5 45 0.1\n"),
+        ParseErrorKind::WrongValueCount {
+            expected: 3,
+            found: 5,
+        }
+    );
+    // 3-port: the tail is swallowed as the start of a 19-value set.
+    let three_port = concat!(
+        "# GHZ S RI R 50\n",
+        "1.0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        "2.0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        "1.0 0.7 0.5 45 0.1\n",
+    );
+    assert_eq!(
+        kind(three_port),
+        ParseErrorKind::WrongValueCount {
+            expected: 19,
+            found: 5,
+        }
+    );
+}
+
+/// The file has no S-data for a noise row to step back from, so there is no
+/// boundary to find and the row is what it looks like: a bad data set.
+#[test]
+fn a_file_that_opens_with_a_noise_row_has_no_boundary_to_find() {
+    let opts = ParseOptions::new().nports(2);
+    let input = "# GHZ S RI R 50\n1.0 0.7 0.5 45 0.1\n";
+    assert!(matches!(
+        parse_str_with(input, &opts),
+        Err(Error::Parse {
+            kind: ParseErrorKind::WrongValueCount {
+                expected: 9,
+                found: 5
+            },
+            ..
+        })
+    ));
+}
+
+/// **Why the boundary is tested as soon as five values are buffered.** A
+/// truncated noise row holds four values — an even count, which the
+/// accumulation rule treats as a *continuation*. Left to close on its own,
+/// the pair would total nine, exactly a 2-port data set, and the file would
+/// be blamed for the frequency-ordering violation that reading is invented
+/// from. The boundary is therefore recognized at the fifth value, before the
+/// next line can be absorbed.
+#[test]
+fn a_truncated_noise_row_is_reported_as_one_not_as_a_wrapped_data_set() {
+    let (line, kind) = fails(concat!(
+        "# GHZ S RI R 50\n",
+        "1.0 0 0 0 0 0 0 0 0\n",
+        "2.0 0 0 0 0 0 0 0 0\n",
+        "1.0 0.7 0.5 45 0.1\n",
+        "2.0 0.7 0.5 45\n",
+    ));
+    assert_eq!(line, 5, "the truncated row, not the row that closed it");
+    assert_eq!(
+        kind,
+        ParseErrorKind::MalformedNoiseLine {
+            found: 4,
+            noise_starts_at: 4,
+        }
+    );
+    assert_eq!(
+        Error::Parse { line, kind }.to_string(),
+        "line 5: expected 5 values in a noise parameter line, found 4 \
+         (the noise section begins at line 4)"
+    );
+}
+
+/// **The known cost of testing the boundary early**, pinned so it is a
+/// decision rather than a surprise.
+///
+/// A 2-port file that *both* wraps its data sets 5 + 4 and breaks its own
+/// frequency order is invalid under either reading of its fourth line: as the
+/// start of a noise section, or as a wrapped data set that steps backwards.
+/// The parser draws the boundary, because that is the only reading under
+/// which such a file could have been well-formed — and then rejects the 4
+/// values that follow. Written nine tokens to a line, the same defect reports
+/// itself directly as an ordering fault.
+///
+/// The file is rejected either way, so nothing is read wrongly; only the
+/// diagnosis differs, and it names the line the section was judged to start
+/// on so a reader who meant a wrapped set can see the inference. Trading that
+/// away would mean making the boundary rule depend on how earlier sets
+/// happened to be wrapped — a worse rule, for a message on doubly-malformed
+/// input in a layout no generator emits.
+#[test]
+fn a_wrapped_two_port_set_that_steps_backwards_is_read_as_a_noise_section() {
+    let wrapped = concat!(
+        "# GHZ S RI R 50\n",
+        "10.0 0 0 0 0\n",
+        "     0 0 0 0\n",
+        "9.0 0 0 0 0\n",
+        "     0 0 0 0\n",
+    );
+    assert_eq!(
+        kind(wrapped),
+        ParseErrorKind::MalformedNoiseLine {
+            found: 4,
+            noise_starts_at: 4,
+        }
+    );
+
+    // The same defect, unwrapped: diagnosed directly.
+    assert_eq!(
+        kind("# GHZ S RI R 50\n10.0 0 0 0 0 0 0 0 0\n9.0 0 0 0 0 0 0 0 0\n"),
+        ParseErrorKind::FrequencyNotAscending {
+            previous_hz: 10e9,
+            current_hz: 9e9,
+        }
+    );
+}
+
+/// Spec v1.1 §3 puts the noise data after *all* the network data. A 9-value
+/// line inside the section looks perfectly well-formed on its own, so the
+/// message has to name the section and where it began — otherwise the reader
+/// is told five values were expected on a line that plainly holds a fine
+/// 2-port point, with nothing to say why.
+#[test]
+fn s_data_after_the_noise_section_is_blamed_on_the_section_it_is_in() {
+    let (line, kind) = fails(concat!(
+        "# GHZ S RI R 50\n",
+        "1.0 0 0 0 0 0 0 0 0\n",
+        "2.0 0 0 0 0 0 0 0 0\n",
+        "1.0 0.7 0.5 45 0.1\n",
+        "3.0 0 0 0 0 0 0 0 0\n",
+    ));
+    assert_eq!(line, 5);
+    assert_eq!(
+        kind,
+        ParseErrorKind::MalformedNoiseLine {
+            found: 9,
+            noise_starts_at: 4,
+        }
+    );
+}
+
+/// The noise sweep is strict in the same way the S sweep is (ADR 0004): a
+/// repeated or backwards frequency is non-conformant, and silently keeping
+/// both points would leave a `Network` whose noise arrays cannot be
+/// interpolated. Reported apart from the S-data ordering error so it cannot
+/// be read as the boundary having been found in the wrong place.
+#[test]
+fn noise_frequencies_must_increase() {
+    let prefix = "# GHZ S RI R 50\n1.0 0 0 0 0 0 0 0 0\n2.0 0 0 0 0 0 0 0 0\n1.0 0.7 0.5 45 0.1\n";
+
+    let (line, backwards) = fails(&format!("{prefix}0.5 0.8 0.4 30 0.2\n"));
+    assert_eq!(line, 5);
+    assert_eq!(
+        backwards,
+        ParseErrorKind::NoiseFrequencyNotAscending {
+            previous_hz: 1e9,
+            current_hz: 0.5e9,
+        }
+    );
+
+    // Equal counts as not increasing, exactly as it does for S-data.
+    assert_eq!(
+        kind(&format!("{prefix}1.0 0.8 0.4 30 0.2\n")),
+        ParseErrorKind::NoiseFrequencyNotAscending {
+            previous_hz: 1e9,
+            current_hz: 1e9,
+        }
+    );
+}
+
+/// Five bare numbers give the reader nothing to go on, so the message names
+/// the column. Unlike an S-value, these are checked before conversion: NFmin
+/// and Rn are stored as written, so there is no converted value to check.
+#[test]
+fn a_non_finite_noise_value_names_its_column() {
+    let with_row =
+        |row: &str| format!("# GHZ S RI R 50\n1.0 0 0 0 0 0 0 0 0\n2.0 0 0 0 0 0 0 0 0\n{row}\n");
+    for (row, column) in [
+        ("1.0 nan 0.5 45 0.1", "nfmin"),
+        ("1.0 0.7 inf 45 0.1", "|gamma_opt|"),
+        ("1.0 0.7 0.5 nan 0.1", "angle(gamma_opt)"),
+        ("1.0 0.7 0.5 45 inf", "rn"),
+    ] {
+        let found = kind(&with_row(row));
+        assert!(
+            matches!(found, ParseErrorKind::NonFiniteNoiseValue { column: c, .. } if c == column),
+            "row {row:?} should name {column}, got {found:?}"
+        );
+    }
+
+    // An unusable *frequency* is still quoted as the file spells it, the way
+    // it is anywhere else — `1e400` is not a word in the reader's file.
+    assert_eq!(
+        kind(&with_row("1e400 0.7 0.5 45 0.1")),
+        ParseErrorKind::InvalidNumber("1e400".to_string())
+    );
+}
+
 // ---------------------------------------------------------------- error path
 
 #[test]
@@ -728,48 +1153,6 @@ fn out_of_scope_parameters_name_the_limit() {
     }
 }
 
-/// The noise section must announce itself. Every real 2-port amplifier file
-/// has one, and a generic ordering error here would send the user hunting
-/// for corruption in a perfectly valid file.
-#[test]
-fn a_noise_section_is_reported_by_name_not_as_an_ordering_error() {
-    let (line, kind) = fails(concat!(
-        "# GHZ S RI R 50\n",
-        "2.0 0 0 0 0 0 0 0 0\n",
-        "22.0 0 0 0 0 0 0 0 0\n",
-        "! NOISE PARAMETERS\n",
-        "4.0 0.7 0.64 69.0 0.38\n",
-    ));
-    assert_eq!(line, 5);
-    assert_eq!(kind, ParseErrorKind::NoiseSectionUnsupported);
-
-    assert_eq!(
-        Error::Parse { line, kind }.to_string(),
-        "line 5: noise parameter section is not supported in this version"
-    );
-}
-
-/// Noise detection compares against the last S-parameter frequency because
-/// spec v1.1 guarantees genuine noise data satisfies that bound (the lowest
-/// noise frequency is always at or below the highest network-parameter
-/// frequency). A file whose 5-value tail keeps *ascending* past the S-sweep
-/// is already non-conformant a second way, and this version does not try to
-/// guess that it's noise — it reports the generic, still-accurate
-/// value-count mismatch instead. Deliberate, not an oversight: dropping the
-/// frequency comparison entirely would misclassify a legitimate M2-style
-/// wrapped 2-port continuation (which also has 5 values on its first line)
-/// as an unsupported noise section.
-#[test]
-fn a_five_value_line_that_keeps_ascending_is_not_mistaken_for_noise() {
-    assert_eq!(
-        kind("# GHZ S RI R 50\n1.0 0 0 0 0 0 0 0 0\n2.0 0 0 0 0\n"),
-        ParseErrorKind::WrongValueCount {
-            expected: 9,
-            found: 5,
-        }
-    );
-}
-
 /// Rust's `f64` parser accepts "nan" and "inf" as tokens. Whether that is a
 /// problem depends on what the value *converts to*, not on how it is spelled
 /// — which is the whole reason the check moved downstream of the conversion.
@@ -860,6 +1243,32 @@ fn an_out_of_scope_parameter_is_reported_even_without_any_data() {
     );
 }
 
+/// A DOS-era exporter signs off with `0x1A`, the CP/M end-of-file marker.
+/// It is not whitespace, so `split_whitespace` hands it over as a token that
+/// cannot be a number — and one that prints as nothing at all, leaving the
+/// reader an "invalid number: " with an empty quote. Vendor transistor files
+/// from the early 1990s end exactly this way, right after their noise
+/// section — which is where this turned up.
+#[test]
+fn a_trailing_dos_eof_marker_does_not_stop_a_file_reading() {
+    let net = ok(&format!("{MINIMAL}\u{1a}\r\n"));
+    assert_eq!(net.nfreqs(), 1);
+
+    // With a noise section, since that is where a real file puts it.
+    let with_noise = ok(&format!("{NOISY_TWO_PORT}\u{1a}\n"));
+    assert_eq!(
+        with_noise.noise.expect("a noise section").freq_hz,
+        [4e9, 18e9]
+    );
+
+    // Not a licence to ignore the byte anywhere else: mid-file it would be
+    // hiding data behind it, and it is still an error.
+    assert!(matches!(
+        kind("# GHZ S RI R 50\n\u{1a}\n1.0 0 0 0 0 0 0 0 0\n"),
+        ParseErrorKind::InvalidNumber(_)
+    ));
+}
+
 #[test]
 fn carriage_return_only_files_are_rejected_clearly() {
     let cr_only = MINIMAL.replace('\n', "\r");
@@ -926,13 +1335,173 @@ fn a_real_ads_export_parses_from_disk() {
     assert_eq!(net.nfreqs(), 10);
 }
 
-/// The full ADS export this fixture was derived from still carries its
-/// noise section, and this version must reject it by name rather than with
-/// a generic ordering error.
+/// The full ADS export the fixture above was truncated from, noise section
+/// intact. Its `! Noise params` line is a comment the parser never reads —
+/// what marks the boundary is the frequency dropping from 10 GHz back to 1.
 #[test]
-fn the_full_ads_export_with_its_noise_section_is_rejected_by_name() {
+fn the_full_ads_export_reads_both_of_its_sections() {
     const FULL: &str = include_str!("../../../tests/data/ads_unilateral_2port_ri_with_noise.s2p");
-    assert_eq!(kind(FULL), ParseErrorKind::NoiseSectionUnsupported);
+    let net = ok(FULL);
+
+    // The S-data must survive unchanged: this is the same ten points as the
+    // truncated sibling, which the tests above pin value by value.
+    let truncated = ok(include_str!(
+        "../../../tests/data/ads_unilateral_2port_ri.s2p"
+    ));
+    assert_agrees(&net, &truncated, "with and without the noise section");
+
+    let noise = net.noise.expect("the export carries a noise section");
+    assert_eq!(noise.freq_hz.len(), 10);
+    assert_eq!(noise.freq_hz[0], 1e9);
+    assert_eq!(noise.freq_hz[9], 10e9);
+    assert_eq!(noise.nfmin_db[0], 0.867_147_791);
+    assert_eq!(noise.rn[0], 0.02, "normalized, exactly as written");
+    // `0.668046366 <180` — the angle is exactly half a turn, so the real
+    // part carries the whole value and the imaginary part is what `sin`
+    // makes of π: not quite zero, and not worth pretending otherwise.
+    assert_close(
+        noise.gamma_opt[0],
+        Complex64::new(-0.668_046_366, 0.0),
+        "gamma_opt at 1 GHz",
+    );
+
+    // The truncated fixture is the same file without the section, so it must
+    // report no noise at all rather than an empty one.
+    assert!(truncated.noise.is_none());
+}
+
+/// The three ADS exports of one device carry **byte-identical noise
+/// sections** while writing their S-data three different ways — which is the
+/// spec's "(MA)" rule for Γopt observed in a real tool's output rather than
+/// read off a page. Equality here is exact, not approximate: the noise path
+/// never consults the format, so all three do the same arithmetic on the
+/// same tokens.
+#[test]
+fn the_three_ads_exports_agree_on_their_noise_section() {
+    let ri = noise_of(include_str!(
+        "../../../tests/data/ads_unilateral_2port_ri_with_noise.s2p"
+    ));
+    let ma = noise_of(include_str!(
+        "../../../tests/data/ads_unilateral_2port_ma_with_noise.s2p"
+    ));
+    let db = noise_of(include_str!(
+        "../../../tests/data/ads_unilateral_2port_db_with_noise.s2p"
+    ));
+    assert_eq!(ri, ma, "RI and MA");
+    assert_eq!(ri, db, "RI and DB");
+}
+
+// ------------------------------- the varying-noise 2-port ADS family (M3)
+
+const VARYING_NOISE_RI: &str = include_str!("../../../tests/data/ads_varying_noise_2port_ri.s2p");
+const VARYING_NOISE_MA: &str = include_str!("../../../tests/data/ads_varying_noise_2port_ma.s2p");
+const VARYING_NOISE_DB: &str = include_str!("../../../tests/data/ads_varying_noise_2port_db.s2p");
+
+/// The fixture family M3 was generated for. The unilateral device's noise
+/// section repeats one row ten times — every angle exactly 180°, so `sin` is
+/// zero and a real/imaginary swap in Γopt is invisible, and every row equal,
+/// so a section read one row out of step would look perfectly self-consistent.
+/// Here nothing repeats and no angle sits on an axis.
+///
+/// The `assert!`s on variation are deliberate: they make the fixture guard
+/// its own usefulness, the way `multiport::assert_not_reciprocal` does for
+/// the multi-port files. A re-export that flattened this data would fail
+/// here rather than quietly weakening the suite.
+#[test]
+fn the_varying_noise_export_reads_a_section_where_every_value_moves() {
+    let net = ok(VARYING_NOISE_RI);
+    assert_eq!(net.nfreqs(), 10);
+
+    let noise = net.noise.expect("the export carries a noise section");
+    assert_eq!(noise.freq_hz.len(), 10);
+    assert_eq!(noise.freq_hz[0], 1e9);
+    assert_eq!(noise.freq_hz[9], 10e9);
+
+    // Every column genuinely varies point to point.
+    for (what, values) in [("nfmin_db", &noise.nfmin_db), ("rn", &noise.rn)] {
+        assert!(
+            values.windows(2).all(|w| w[0] != w[1]),
+            "{what} must change at every point for this fixture to be worth having"
+        );
+    }
+    assert!(
+        noise.gamma_opt.windows(2).all(|w| w[0] != w[1]),
+        "gamma_opt must change at every point"
+    );
+    assert!(
+        noise.gamma_opt.iter().all(|g| g.im.abs() > 1e-3),
+        "no angle may sit on the real axis, or a re/im swap would go unseen"
+    );
+
+    // First point, spelled out: `6.74671044  0.829397701  77.8913543  6.75900622`.
+    assert_eq!(noise.nfmin_db[0], 6.746_710_44);
+    assert_eq!(noise.rn[0], 6.759_006_22, "normalized, exactly as written");
+    assert_close(
+        noise.gamma_opt[0],
+        Complex64::new(0.173_979_524_4, 0.810_944_925_1),
+        "gamma_opt at 1 GHz",
+    );
+}
+
+/// The cross-format check extended to the noise section. The S-data is
+/// written three ways and must agree within the exports' own rounding; the
+/// noise rows are byte-identical in all three files, so those must agree
+/// *exactly*. That difference is the point: it is the spec's "(MA)" rule for
+/// Γopt showing up in a real tool's output rather than on a page.
+#[test]
+fn the_three_varying_noise_exports_agree_on_both_sections() {
+    let (ri, ma, db) = (
+        ok(VARYING_NOISE_RI),
+        ok(VARYING_NOISE_MA),
+        ok(VARYING_NOISE_DB),
+    );
+    assert_eq!(ri.metadata.format, Format::Ri);
+    assert_eq!(ma.metadata.format, Format::Ma);
+    assert_eq!(db.metadata.format, Format::Db);
+
+    assert_agrees(&ma, &ri, "varying-noise 2-port ma");
+    assert_agrees(&db, &ri, "varying-noise 2-port db");
+
+    let noise = |net: &Network| net.noise.clone().expect("all three carry noise");
+    assert_eq!(noise(&ma), noise(&ri), "MA and RI noise sections");
+    assert_eq!(noise(&db), noise(&ri), "DB and RI noise sections");
+}
+
+/// **Noise on a coarser grid than the S-data.** ADS computes noise at the
+/// S-parameter sweep's frequencies, so this fixture is the RI export with
+/// every second noise row deleted — each surviving row byte-identical to the
+/// source. Vendor files are routinely shaped this way — two noise points
+/// against twenty-odd S-parameter ones is ordinary — and nothing in the
+/// reader may assume the two arrays share a length or a grid.
+#[test]
+fn noise_may_sit_on_a_coarser_grid_than_the_s_data() {
+    let net = ok(include_str!(
+        "../../../tests/data/ads_varying_noise_2port_ri_coarse_grid.s2p"
+    ));
+    assert_eq!(net.nfreqs(), 10, "the S sweep is untouched");
+
+    let noise = net.noise.expect("a noise section");
+    assert_eq!(noise.freq_hz, [1e9, 3e9, 5e9, 7e9, 9e9]);
+
+    // Every surviving row must read exactly as it does in the full export:
+    // dropping rows may not shift what lands in the ones that remain, which
+    // is the failure a repeating noise section could never expose.
+    let full = noise_of(VARYING_NOISE_RI);
+    for (sparse, complete) in (0..5).map(|i| (i, i * 2)) {
+        assert_eq!(
+            noise.freq_hz[sparse], full.freq_hz[complete],
+            "freq {sparse}"
+        );
+        assert_eq!(
+            noise.nfmin_db[sparse], full.nfmin_db[complete],
+            "nfmin {sparse}"
+        );
+        assert_eq!(
+            noise.gamma_opt[sparse], full.gamma_opt[complete],
+            "gamma_opt {sparse}"
+        );
+        assert_eq!(noise.rn[sparse], full.rn[complete], "rn {sparse}");
+    }
 }
 
 /// The same device, exported by ADS in all three formats. **This is the
@@ -1248,15 +1817,32 @@ mod multiport {
 }
 
 /// The QUCS export of the same device: no `!` header at all, verbose
-/// `e+009` exponents, and a blank line before a noise-shaped tail with no
-/// `! Noise params` label. Its S-data half is M2's business — reaching the
-/// noise boundary and naming it proves every layout quirk before that point
-/// was handled, since anything else would have failed earlier and
-/// differently. Parsing the tail is M3's job.
+/// `e+009` exponents, a blank line between the two sections, and — the part
+/// that matters here — **no `! Noise params` label anywhere**. Its noise
+/// section is found by the frequency heuristic alone, which is the harder
+/// and more representative case: a comment cue is a convention, not a rule,
+/// and a parser that needed one would fail on this real file.
 #[test]
-fn the_qucs_export_parses_its_layout_quirks_and_stops_at_the_noise_tail() {
+fn the_qucs_export_finds_its_noise_section_without_a_comment_to_mark_it() {
     const QUCS: &str = include_str!("../../../tests/data/qucs_unilateral_2port_ri_with_noise.s2p");
-    let (line, kind) = fails(QUCS);
-    assert_eq!(kind, ParseErrorKind::NoiseSectionUnsupported);
-    assert_eq!(line, 13, "the first line of the unlabelled noise tail");
+    let net = ok(QUCS);
+
+    assert_eq!(net.nports, 2);
+    assert_eq!(net.nfreqs(), 10, "ten S points, not twenty");
+    assert_eq!(net.freq_hz[9], 1e10);
+
+    let noise = net.noise.expect("the unlabelled tail is a noise section");
+    assert_eq!(noise.freq_hz.len(), 10);
+    assert_eq!(
+        noise.freq_hz[0], 1e9,
+        "the tail restarts the sweep at 1 GHz — the drop from 10 GHz is the \
+         only thing marking the boundary"
+    );
+    assert_eq!(noise.nfmin_db[0], 9.486_103_827_042_164e-1);
+    assert_eq!(noise.rn[0], 1.826_178_747_361_001e-2);
+    assert_close(
+        noise.gamma_opt[0],
+        Complex64::new(-0.684_967_198_379_499_8, 0.0),
+        "gamma_opt at 1 GHz",
+    );
 }

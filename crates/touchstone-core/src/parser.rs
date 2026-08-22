@@ -6,20 +6,26 @@
 //! read one point per line — see [`DataSets`] for the boundary rule.
 //!
 //! This version handles every value format (`RI`/`MA`/`DB`) at every port
-//! count. Parameter types other than `S`, and the 2-port noise section, are
-//! rejected with a message that names the limit rather than looking like a
-//! bug (see ADR 0004).
+//! count, and the optional 2-port noise section that follows the network
+//! data — which no keyword announces, so it has to be found by inference
+//! (see [`DataSets::flush`] and ADR 0007). Parameter types other than `S`
+//! are rejected with a message that names the limit rather than looking
+//! like a bug (see ADR 0004).
 
 use num_complex::Complex64;
 
 use crate::ParseOptions;
 use crate::error::{Error, ParseErrorKind};
-use crate::lines::{has_cr_only_line_endings, logical_lines};
-use crate::model::{Format, Metadata, Network, Parameter, Version};
+use crate::lines::{has_cr_only_line_endings, logical_lines, without_trailing_eof_marker};
+use crate::model::{Format, Metadata, Network, NoiseData, Parameter, Version};
 use crate::option_line::{Options, parse_option_line};
 
 /// Parse a v1 Touchstone file.
 pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Error> {
+    // A DOS-era exporter may sign off with a `0x1A`. It is not data, and it
+    // is not whitespace either, so it has to come off before tokenizing.
+    let input = without_trailing_eof_marker(input);
+
     if has_cr_only_line_endings(input) {
         return Err(err(1, ParseErrorKind::UnsupportedLineEndings));
     }
@@ -39,12 +45,12 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
     for line in logical_lines(input) {
         if line.content.is_empty() {
             // Blank, or nothing but a comment. Only the header block is
-            // retained: files in the wild carry a comment on every data row
-            // (a Philips transistor export has one per line), and keeping
-            // hundreds of those costs allocations no consumer wants. Blank
-            // lines between frequency blocks — which Keysight's multi-port
-            // examples and the QUCS export both emit — fall through here
-            // without disturbing a data set in progress.
+            // retained: files in the wild carry a comment on every data row —
+            // a per-row figure of merit, say — and keeping hundreds of those
+            // costs allocations no consumer wants. Blank lines between
+            // frequency blocks — which Keysight's multi-port examples and the
+            // QUCS export both emit — fall through here without disturbing a
+            // data set in progress.
             if sets.before_any_data() {
                 if let Some(text) = line.comment {
                     comments.push(text.to_string());
@@ -114,7 +120,7 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
         s: sets.s,
         nports: n,
         z0: vec![opts_ref.resistance; n],
-        noise: None,
+        noise: sets.noise,
         metadata: Metadata {
             version: Version::V1,
             freq_unit: opts_ref.freq_unit,
@@ -148,6 +154,11 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
 /// exists to read, which wrap inconsistently; trusting the blank lines that
 /// Keysight's examples put between blocks would break on the many files that
 /// omit them.
+///
+/// A 2-port file may append a noise section to its network data with nothing
+/// to announce it, so the same accumulator also carries the switch into that
+/// section — see [`DataSets::flush`], where the boundary is recognized, and
+/// [`DataSets::flush_noise`], which shapes everything after it.
 struct DataSets<'a> {
     freq_hz: Vec<f64>,
     s: Vec<Complex64>,
@@ -167,6 +178,20 @@ struct DataSets<'a> {
     /// `f64` would tell the reader to search their file for a word that is
     /// not in it.
     frequency_token: &'a str,
+    /// Noise points read since the section boundary. `Some` from the moment
+    /// the boundary is crossed — which is also what re-shapes every later
+    /// data set from `1 + 2n²` values to a noise point's five.
+    ///
+    /// The section is terminal: nothing turns this back off, because spec
+    /// v1.1 §3 puts the noise data after *all* the network data, and a file
+    /// that resumes S-parameters afterwards is malformed rather than
+    /// interestingly structured.
+    noise: Option<NoiseData>,
+    /// Line the noise section was found to start on. Only meaningful once
+    /// `noise` is `Some`; it goes into the error for a malformed noise line,
+    /// where the reader's real question is "why is this line being read as
+    /// noise at all?".
+    noise_line: usize,
 }
 
 impl<'a> DataSets<'a> {
@@ -178,6 +203,8 @@ impl<'a> DataSets<'a> {
             block: Vec::new(),
             block_line: 0,
             frequency_token: "",
+            noise: None,
+            noise_line: 0,
         }
     }
 
@@ -215,12 +242,68 @@ impl<'a> DataSets<'a> {
         // This is also where a port count that cannot describe a data set is
         // caught, on the first data line rather than after reading the file.
         if let Some(n) = self.nports {
-            let expected = values_per_set(n, line)?;
-            if self.block.len() >= expected {
+            let expected = self.expected_len(n, line)?;
+            if self.block.len() >= expected || self.at_noise_boundary(n, opts) {
                 self.flush(opts)?;
             }
         }
         Ok(())
+    }
+
+    /// How many values a completed data set holds *right now*: five once the
+    /// noise boundary has been crossed, `1 + 2n²` before it.
+    ///
+    /// Inside the noise section the port count no longer describes a data
+    /// set, and consulting it would make every noise line look like a
+    /// truncated 2-port point.
+    fn expected_len(&self, nports: usize, line: usize) -> Result<usize, Error> {
+        if self.noise.is_some() {
+            Ok(NOISE_VALUES_PER_SET)
+        } else {
+            values_per_set(nports, line)
+        }
+    }
+
+    /// Whether the values buffered so far are the opening line of a noise
+    /// section.
+    ///
+    /// Spec v1.1 §3 allows a noise section only in 2-port files, and no
+    /// keyword announces it: a reader finds its start by the frequency
+    /// stepping back into the already-covered sweep. The doc states the bound
+    /// twice and inconsistently — p10 says the first noise frequency is *less
+    /// than* the last S-parameter frequency, p11 says the lowest is *less
+    /// than or equal to* the highest — and `<=` is the only reading that
+    /// accepts Keysight's own documented example and the real ADS exports in
+    /// `tests/data/`, all of which restart the noise sweep at the S-sweep's
+    /// *first* frequency. See ADR 0007.
+    ///
+    /// Asked as soon as five values are buffered, not only when a set closes.
+    /// Waiting would let a *truncated* noise row be swallowed as the
+    /// continuation of the row above it — five values plus four is nine,
+    /// exactly the shape of a 2-port data set — and the file would then be
+    /// blamed for a frequency-ordering problem it does not have.
+    ///
+    /// It cannot fire on a well-formed set: a legitimate 2-port set wrapped
+    /// as 5 + 4 (which ADR 0006 accepts) opens with an *ascending* frequency,
+    /// and the condition here is precisely that the frequency does not
+    /// ascend. It *can* fire early on a **malformed** one, and the trade is
+    /// deliberate. A 2-port file that both wraps its sets 5 + 4 and breaks
+    /// its own frequency order gets the boundary drawn at the offending line
+    /// and is then rejected for a malformed noise row, where the same file
+    /// written nine tokens to a line reports the ordering fault directly.
+    /// Both readings describe an invalid file; this one is preferred because
+    /// it is the only reading under which the file could have been valid, and
+    /// the error names the line the section was judged to start on precisely
+    /// so a reader who meant a wrapped data set can see the inference that
+    /// was made.
+    fn at_noise_boundary(&self, nports: usize, opts: &Options) -> bool {
+        self.noise.is_none()
+            && nports == 2
+            && self.block.len() == NOISE_VALUES_PER_SET
+            && self
+                .freq_hz
+                .last()
+                .is_some_and(|&last_s_freq| last_s_freq >= self.block[0] * opts.freq_unit.to_hz())
     }
 
     /// Emit any set still buffered at end of file.
@@ -231,11 +314,16 @@ impl<'a> DataSets<'a> {
         self.flush(opts)
     }
 
-    /// Turn the buffered data set into one frequency point.
+    /// Turn the buffered data set into one frequency point — or, once the
+    /// noise boundary has been crossed, into one noise point.
     fn flush(&mut self, opts: &Options) -> Result<(), Error> {
         debug_assert!(!self.block.is_empty(), "callers check before flushing");
         let line = self.block_line;
         let scale = opts.freq_unit.to_hz();
+
+        if self.noise.is_some() {
+            return self.flush_noise(scale);
+        }
 
         let n = match self.nports {
             Some(n) => n,
@@ -248,24 +336,25 @@ impl<'a> DataSets<'a> {
             }
         };
 
-        // Spec v1.1 §3 allows a noise section only in 2-port files, and says
-        // a reader finds its start by the frequency stepping back into the
-        // already-covered sweep. The doc states the bound twice and
-        // inconsistently — p10 says the first noise frequency is *less than*
-        // the last S-parameter frequency, p11 says the lowest is *less than
-        // or equal to* the highest — and `<=` is the only reading that
-        // accepts Keysight's own example and the real ADS export, both of
-        // which restart the noise sweep at the S-sweep's first frequency.
-        //
-        // Tested on a *completed* set, not on a 5-value line: a legitimate
-        // 2-port set wrapped as 5 + 4 also opens with five values, and
-        // misreading that as noise would reject a valid file.
-        if n == 2
-            && self.block.len() == NOISE_VALUES_PER_LINE
-            && let Some(&last_s_freq) = self.freq_hz.last()
-            && last_s_freq >= self.block[0] * scale
-        {
-            return Err(err(line, ParseErrorKind::NoiseSectionUnsupported));
+        // Checked before anything is decided from it, because a frequency
+        // that is not a usable number makes both of the questions below
+        // meaningless: which section this set belongs to, and whether it
+        // arrived in order.
+        let frequency = self.block[0] * scale;
+        if !frequency.is_finite() {
+            return Err(err(
+                line,
+                ParseErrorKind::InvalidNumber(self.frequency_token.to_string()),
+            ));
+        }
+
+        // The noise section begins here, and everything after it is noise —
+        // see `at_noise_boundary` for how the start is recognized and why
+        // that is the only thing marking it.
+        if self.at_noise_boundary(n, opts) {
+            self.noise = Some(NoiseData::default());
+            self.noise_line = line;
+            return self.flush_noise(scale);
         }
 
         let expected = values_per_set(n, line)?;
@@ -279,13 +368,6 @@ impl<'a> DataSets<'a> {
             ));
         }
 
-        let frequency = self.block[0] * scale;
-        if !frequency.is_finite() {
-            return Err(err(
-                line,
-                ParseErrorKind::InvalidNumber(self.frequency_token.to_string()),
-            ));
-        }
         if let Some(&previous) = self.freq_hz.last()
             && frequency <= previous
         {
@@ -304,11 +386,110 @@ impl<'a> DataSets<'a> {
         self.block.clear();
         Ok(())
     }
+
+    /// Turn the buffered five values into one noise point.
+    ///
+    /// Spec v1.1 §3 p10 gives the entries as `<freq> <NFmin dB> <|Γopt|>
+    /// <∠Γopt> <Rn>` and marks the third and fourth **"(MA)"** — a linear
+    /// magnitude and an angle in degrees — *whatever* the option line's value
+    /// format says. So Γopt is built with [`from_polar`] even in an `RI` or
+    /// `DB` file, and the three ADS exports of one device in `tests/data/`
+    /// confirm it: their noise sections are byte-for-byte identical while
+    /// their S-data is written three different ways.
+    ///
+    /// `Rn` is stored exactly as written. Spec p11 says both it and Γopt are
+    /// given against the option line's `R`, so what the file holds is already
+    /// normalized; denormalizing here would invent a quantity the file does
+    /// not contain and cost the writer its round trip. `z0` sits on the same
+    /// [`Network`] for anyone who wants ohms.
+    ///
+    /// Nothing here range-checks the values. `|Γopt|` above 1 is unphysical
+    /// and Keysight's own documented example writes it *negative*; p10
+    /// likewise leaves clamping an out-of-range `Rn` to the simulator, as
+    /// something it *may* do. This is an I/O layer — it reports the file.
+    fn flush_noise(&mut self, scale: f64) -> Result<(), Error> {
+        let line = self.block_line;
+        let found = self.block.len();
+        if found != NOISE_VALUES_PER_SET {
+            return Err(err(
+                line,
+                ParseErrorKind::MalformedNoiseLine {
+                    found,
+                    noise_starts_at: self.noise_line,
+                },
+            ));
+        }
+        let &[in_units, nfmin_db, gamma_magnitude, gamma_angle_deg, rn] = &self.block[..] else {
+            unreachable!("length checked immediately above");
+        };
+
+        let frequency = in_units * scale;
+        if !frequency.is_finite() {
+            return Err(err(
+                line,
+                ParseErrorKind::InvalidNumber(self.frequency_token.to_string()),
+            ));
+        }
+        // Unlike the S-values, these are checked before conversion rather
+        // than after. The two are equivalent for Γopt — finite inputs to
+        // `from_polar` cannot produce a non-finite output, and a non-finite
+        // input always does — and NFmin and Rn are stored as written, so
+        // there is no conversion to check downstream of. Doing it here buys
+        // a message that names which of five bare numbers was the problem.
+        for (column, value) in [
+            ("nfmin", nfmin_db),
+            ("|gamma_opt|", gamma_magnitude),
+            ("angle(gamma_opt)", gamma_angle_deg),
+            ("rn", rn),
+        ] {
+            if !value.is_finite() {
+                return Err(err(
+                    line,
+                    ParseErrorKind::NonFiniteNoiseValue { column, value },
+                ));
+            }
+        }
+
+        let noise = self
+            .noise
+            .as_mut()
+            .expect("`flush_noise` is only reached once the section has begun");
+        if let Some(&previous) = noise.freq_hz.last()
+            && frequency <= previous
+        {
+            return Err(err(
+                line,
+                ParseErrorKind::NoiseFrequencyNotAscending {
+                    previous_hz: previous,
+                    current_hz: frequency,
+                },
+            ));
+        }
+
+        noise.freq_hz.push(frequency);
+        noise.nfmin_db.push(nfmin_db);
+        noise
+            .gamma_opt
+            .push(from_polar(gamma_magnitude, gamma_angle_deg));
+        noise.rn.push(rn);
+        self.block.clear();
+        Ok(())
+    }
 }
 
-/// Entries on one line of the noise section: frequency, NFmin, |Γopt|,
-/// ∠Γopt, Rn.
-const NOISE_VALUES_PER_LINE: usize = 5;
+/// Values in one noise data set: frequency, NFmin, |Γopt|, ∠Γopt, Rn.
+///
+/// Spec v1.1 §3 p10 puts all five on one line, and the odd/even rule makes
+/// that automatic — five is odd, so every noise line opens a set of its own
+/// and closes as soon as it is full. A noise point in a conforming file is
+/// therefore never accumulated across lines.
+///
+/// A row split some other way — 3 + 2, say — still adds up to five and is
+/// accepted, which is the same wrapping tolerance ADR 0006 already grants
+/// S-data and is admitted here for the same reason: the values and their
+/// order are unambiguous. Any split that does *not* total five is reported
+/// as the malformed noise line it is.
+pub(crate) const NOISE_VALUES_PER_SET: usize = 5;
 
 /// Values in one data set for an `n`-port network: a frequency plus one
 /// pair per matrix entry.

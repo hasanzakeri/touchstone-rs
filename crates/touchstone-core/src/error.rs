@@ -6,6 +6,7 @@
 use std::fmt;
 
 use crate::model::Parameter;
+use crate::parser::NOISE_VALUES_PER_SET;
 
 /// Errors produced while reading or parsing a Touchstone file.
 ///
@@ -77,11 +78,35 @@ pub enum ParseErrorKind {
         previous_hz: f64,
         current_hz: f64,
     },
+    /// The noise section's own frequencies failed to increase. Kept apart
+    /// from [`ParseErrorKind::FrequencyNotAscending`] because the generic
+    /// wording would read as though a noise frequency had been compared
+    /// against the S-parameter sweep — which happens only at the boundary,
+    /// and is how the boundary is found at all.
+    NoiseFrequencyNotAscending {
+        previous_hz: f64,
+        current_hz: f64,
+    },
+    /// A line in the noise section did not hold the five values a noise
+    /// point needs. Kept apart from [`ParseErrorKind::WrongValueCount`]
+    /// because "expected 5 values" reported against what looks like a
+    /// perfectly good 2-port data line sends the reader hunting in the wrong
+    /// place: what it means is that the noise section has already begun, so
+    /// the message says where that happened.
+    MalformedNoiseLine {
+        found: usize,
+        /// Line the noise section was found to start on.
+        noise_starts_at: usize,
+    },
+    /// A noise-parameter entry that is not a finite number. `column` names
+    /// which of the five entries it was — a row of bare numbers gives the
+    /// reader nothing else to go on.
+    NonFiniteNoiseValue {
+        column: &'static str,
+        value: f64,
+    },
     /// A network parameter type this version cannot handle yet.
     UnsupportedParameter(Parameter),
-    /// A 2-port noise section was found. Detected on purpose, and named, so
-    /// the failure does not masquerade as a frequency-ordering error.
-    NoiseSectionUnsupported,
     /// Carriage-return-only line endings, which would collapse the whole
     /// file into a single line.
     UnsupportedLineEndings,
@@ -128,17 +153,30 @@ impl fmt::Display for ParseErrorKind {
                 f,
                 "frequencies must increase: {current_hz} hz follows {previous_hz} hz"
             ),
+            ParseErrorKind::NoiseFrequencyNotAscending {
+                previous_hz,
+                current_hz,
+            } => write!(
+                f,
+                "noise frequencies must increase: {current_hz} hz follows {previous_hz} hz"
+            ),
+            ParseErrorKind::MalformedNoiseLine {
+                found,
+                noise_starts_at,
+            } => write!(
+                f,
+                "expected {NOISE_VALUES_PER_SET} values in a noise parameter \
+                 line, found {found} (the noise section begins at line \
+                 {noise_starts_at})"
+            ),
+            ParseErrorKind::NonFiniteNoiseValue { column, value } => {
+                write!(f, "noise {column} value '{value}' is not a finite number")
+            }
             ParseErrorKind::UnsupportedParameter(p) => write!(
                 f,
                 "unsupported parameter {}: only s-parameters are supported in this version",
                 p.as_str().to_ascii_lowercase()
             ),
-            ParseErrorKind::NoiseSectionUnsupported => {
-                write!(
-                    f,
-                    "noise parameter section is not supported in this version"
-                )
-            }
             ParseErrorKind::UnsupportedLineEndings => {
                 write!(f, "carriage-return-only line endings are not supported")
             }
@@ -150,9 +188,9 @@ impl fmt::Display for ParseErrorKind {
 mod tests {
     use super::*;
 
-    /// The out-of-scope messages are a deliverable: they are what a first
-    /// user sees when they point the parser at a Y-parameter file, and they
-    /// must not read like a bug report.
+    /// The out-of-scope message is a deliverable: it is what a first user
+    /// sees when they point the parser at a Y-parameter file, and it must
+    /// not read like a bug report.
     #[test]
     fn unsupported_messages_name_the_scope_limit() {
         let err = Error::Parse {
@@ -163,14 +201,52 @@ mod tests {
             err.to_string(),
             "line 1: unsupported parameter y: only s-parameters are supported in this version"
         );
+    }
 
+    /// Every noise diagnostic has to say *noise* somewhere. The section is
+    /// found by inference rather than announced by a keyword, so a reader
+    /// who gets a bare "frequencies must increase" on a line they think is
+    /// S-data has no way to tell whether the parser found the boundary in
+    /// the wrong place — which is the first thing they will suspect.
+    #[test]
+    fn noise_diagnostics_say_that_they_are_about_the_noise_section() {
         let err = Error::Parse {
-            line: 42,
-            kind: ParseErrorKind::NoiseSectionUnsupported,
+            line: 19,
+            kind: ParseErrorKind::NoiseFrequencyNotAscending {
+                previous_hz: 4e9,
+                current_hz: 4e9,
+            },
         };
         assert_eq!(
             err.to_string(),
-            "line 42: noise parameter section is not supported in this version"
+            "line 19: noise frequencies must increase: 4000000000 hz follows 4000000000 hz"
+        );
+
+        // The count case names the boundary line, because the fix is
+        // usually somewhere other than the line being complained about.
+        let err = Error::Parse {
+            line: 20,
+            kind: ParseErrorKind::MalformedNoiseLine {
+                found: 9,
+                noise_starts_at: 16,
+            },
+        };
+        assert_eq!(
+            err.to_string(),
+            "line 20: expected 5 values in a noise parameter line, found 9 \
+             (the noise section begins at line 16)"
+        );
+
+        let err = Error::Parse {
+            line: 17,
+            kind: ParseErrorKind::NonFiniteNoiseValue {
+                column: "nfmin",
+                value: f64::NAN,
+            },
+        };
+        assert_eq!(
+            err.to_string(),
+            "line 17: noise nfmin value 'NaN' is not a finite number"
         );
     }
 

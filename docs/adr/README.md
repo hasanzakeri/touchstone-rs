@@ -22,3 +22,4 @@ Decisions that shape this project, recorded at the point they were made.
 | [0004](0004-strict-parsing-with-explicit-tolerances.md) | Strict parsing, with explicit and named tolerances | Accepted |
 | [0005](0005-test-data-provenance-and-licensing.md) | Test data provenance and licensing | Accepted |
 | [0006](0006-data-set-accumulation-and-line-wrapping.md) | Data-set accumulation and line-wrapping tolerance | Accepted |
+| [0007](0007-noise-parameter-section.md) | The noise-parameter section: finding it, and what it means | Accepted |
