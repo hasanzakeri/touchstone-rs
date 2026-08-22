@@ -6,6 +6,7 @@
 use std::fmt;
 
 use crate::model::Parameter;
+use crate::parser::NOISE_VALUES_PER_SET;
 
 /// Errors produced while reading or parsing a Touchstone file.
 ///
@@ -164,8 +165,9 @@ impl fmt::Display for ParseErrorKind {
                 noise_starts_at,
             } => write!(
                 f,
-                "expected 5 values in a noise parameter line, found {found} \
-                 (the noise section begins at line {noise_starts_at})"
+                "expected {NOISE_VALUES_PER_SET} values in a noise parameter \
+                 line, found {found} (the noise section begins at line \
+                 {noise_starts_at})"
             ),
             ParseErrorKind::NonFiniteNoiseValue { column, value } => {
                 write!(f, "noise {column} value '{value}' is not a finite number")

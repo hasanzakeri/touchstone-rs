@@ -47,10 +47,10 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
             // Blank, or nothing but a comment. Only the header block is
             // retained: files in the wild carry a comment on every data row —
             // a per-row figure of merit, say — and keeping hundreds of those
-            // costs allocations no consumer wants. Blank
-            // lines between frequency blocks — which Keysight's multi-port
-            // examples and the QUCS export both emit — fall through here
-            // without disturbing a data set in progress.
+            // costs allocations no consumer wants. Blank lines between
+            // frequency blocks — which Keysight's multi-port examples and the
+            // QUCS export both emit — fall through here without disturbing a
+            // data set in progress.
             if sets.before_any_data() {
                 if let Some(text) = line.comment {
                     comments.push(text.to_string());
@@ -283,10 +283,19 @@ impl<'a> DataSets<'a> {
     /// exactly the shape of a 2-port data set — and the file would then be
     /// blamed for a frequency-ordering problem it does not have.
     ///
-    /// It cannot fire on a well-formed set. A legitimate 2-port set wrapped
-    /// as 5 + 4 (which ADR 0006 accepts) opens with an *ascending*
-    /// frequency, and the condition here is precisely that the frequency does
-    /// not ascend.
+    /// It cannot fire on a well-formed set: a legitimate 2-port set wrapped
+    /// as 5 + 4 (which ADR 0006 accepts) opens with an *ascending* frequency,
+    /// and the condition here is precisely that the frequency does not
+    /// ascend. It *can* fire early on a **malformed** one, and the trade is
+    /// deliberate. A 2-port file that both wraps its sets 5 + 4 and breaks
+    /// its own frequency order gets the boundary drawn at the offending line
+    /// and is then rejected for a malformed noise row, where the same file
+    /// written nine tokens to a line reports the ordering fault directly.
+    /// Both readings describe an invalid file; this one is preferred because
+    /// it is the only reading under which the file could have been valid, and
+    /// the error names the line the section was judged to start on precisely
+    /// so a reader who meant a wrapped data set can see the inference that
+    /// was made.
     fn at_noise_boundary(&self, nports: usize, opts: &Options) -> bool {
         self.noise.is_none()
             && nports == 2
@@ -410,11 +419,11 @@ impl<'a> DataSets<'a> {
                 },
             ));
         }
-        let &[_, nfmin_db, gamma_magnitude, gamma_angle_deg, rn] = &self.block[..] else {
+        let &[in_units, nfmin_db, gamma_magnitude, gamma_angle_deg, rn] = &self.block[..] else {
             unreachable!("length checked immediately above");
         };
 
-        let frequency = self.block[0] * scale;
+        let frequency = in_units * scale;
         if !frequency.is_finite() {
             return Err(err(
                 line,
@@ -472,10 +481,15 @@ impl<'a> DataSets<'a> {
 ///
 /// Spec v1.1 §3 p10 puts all five on one line, and the odd/even rule makes
 /// that automatic — five is odd, so every noise line opens a set of its own
-/// and closes as soon as it is full. A noise point is therefore never
-/// accumulated across lines in a well-formed file, and a line that holds
-/// some other count is reported as the malformed noise line it is.
-const NOISE_VALUES_PER_SET: usize = 5;
+/// and closes as soon as it is full. A noise point in a conforming file is
+/// therefore never accumulated across lines.
+///
+/// A row split some other way — 3 + 2, say — still adds up to five and is
+/// accepted, which is the same wrapping tolerance ADR 0006 already grants
+/// S-data and is admitted here for the same reason: the values and their
+/// order are unambiguous. Any split that does *not* total five is reported
+/// as the malformed noise line it is.
+pub(crate) const NOISE_VALUES_PER_SET: usize = 5;
 
 /// Values in one data set for an `n`-port network: a frequency plus one
 /// pair per matrix entry.

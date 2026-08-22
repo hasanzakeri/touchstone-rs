@@ -52,10 +52,26 @@ truncated noise row diagnosable. A row of four values is an *even* count,
 which ADR 0006's accumulation rule treats as a continuation — so a five-value
 noise row followed by a four-value one totals nine, exactly the shape of a
 2-port data set, and the file would be reported for a frequency-ordering
-violation invented by that reading. Testing at the fifth value cannot
-misfire: a legitimate 2-port set wrapped as 5 + 4, which ADR 0006 accepts,
-opens with an *ascending* frequency, and the boundary condition is precisely
-that the frequency does not ascend.
+violation invented by that reading.
+
+Testing at the fifth value cannot fire on a **well-formed** set: a legitimate
+2-port set wrapped as 5 + 4, which ADR 0006 accepts, opens with an
+*ascending* frequency, and the boundary condition is precisely that the
+frequency does not ascend.
+
+It can fire early on a **malformed** one, and that is the accepted cost. A
+2-port file that both wraps its sets 5 + 4 and breaks its own frequency order
+has the boundary drawn at the offending line and is then rejected for the
+malformed noise row that follows, where the same file written nine tokens to
+a line reports the ordering fault directly. Both readings describe an invalid
+file and neither reads any data wrongly — only the diagnosis differs. The
+noise reading is preferred because it is the only one under which the file
+could have been valid, and the error names the line the section was judged to
+begin on so that a reader who meant a wrapped data set can see the inference
+that was made. The alternative — making the boundary rule conditional on how
+earlier sets happened to be wrapped — buys a better message on doubly
+malformed input, in a layout no generator emits, at the price of a rule that
+can no longer be stated in one sentence.
 
 Everything after the boundary is noise. The section is terminal: spec §3 puts
 it after all the network data, so S-parameter data appearing later is

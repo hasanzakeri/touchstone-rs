@@ -893,6 +893,50 @@ fn a_truncated_noise_row_is_reported_as_one_not_as_a_wrapped_data_set() {
     );
 }
 
+/// **The known cost of testing the boundary early**, pinned so it is a
+/// decision rather than a surprise.
+///
+/// A 2-port file that *both* wraps its data sets 5 + 4 and breaks its own
+/// frequency order is invalid under either reading of its fourth line: as the
+/// start of a noise section, or as a wrapped data set that steps backwards.
+/// The parser draws the boundary, because that is the only reading under
+/// which such a file could have been well-formed — and then rejects the 4
+/// values that follow. Written nine tokens to a line, the same defect reports
+/// itself directly as an ordering fault.
+///
+/// The file is rejected either way, so nothing is read wrongly; only the
+/// diagnosis differs, and it names the line the section was judged to start
+/// on so a reader who meant a wrapped set can see the inference. Trading that
+/// away would mean making the boundary rule depend on how earlier sets
+/// happened to be wrapped — a worse rule, for a message on doubly-malformed
+/// input in a layout no generator emits.
+#[test]
+fn a_wrapped_two_port_set_that_steps_backwards_is_read_as_a_noise_section() {
+    let wrapped = concat!(
+        "# GHZ S RI R 50\n",
+        "10.0 0 0 0 0\n",
+        "     0 0 0 0\n",
+        "9.0 0 0 0 0\n",
+        "     0 0 0 0\n",
+    );
+    assert_eq!(
+        kind(wrapped),
+        ParseErrorKind::MalformedNoiseLine {
+            found: 4,
+            noise_starts_at: 4,
+        }
+    );
+
+    // The same defect, unwrapped: diagnosed directly.
+    assert_eq!(
+        kind("# GHZ S RI R 50\n10.0 0 0 0 0 0 0 0 0\n9.0 0 0 0 0 0 0 0 0\n"),
+        ParseErrorKind::FrequencyNotAscending {
+            previous_hz: 10e9,
+            current_hz: 9e9,
+        }
+    );
+}
+
 /// Spec v1.1 §3 puts the noise data after *all* the network data. A 9-value
 /// line inside the section looks perfectly well-formed on its own, so the
 /// message has to name the section and where it began — otherwise the reader
