@@ -5,9 +5,12 @@
 //! original option line is preserved in [`Metadata`] so writes can
 //! round-trip faithfully.
 //!
-//! This version reads Touchstone 1.0 files holding 2-port S-parameters in
-//! `RI` format. Other formats, port counts, and noise sections are rejected
-//! with an error that names the limit. Parsing is strict by default: see
+//! This version reads Touchstone 1.0 files holding S-parameters in any of
+//! the three value formats, at any port count — including the wrapped
+//! multi-line layout that spec v1.1 §3 prescribes for 3-port and larger
+//! networks. Other parameter types (`Y`/`Z`/`G`/`H`) and the 2-port noise
+//! section are rejected with an error that names the limit. Parsing is
+//! strict by default: see
 //! `docs/adr/0004-strict-parsing-with-explicit-tolerances.md`.
 //!
 //! ```
@@ -56,9 +59,12 @@ impl ParseOptions {
 }
 
 /// Parse a Touchstone file from a string, inferring the port count from the
-/// first data line.
+/// size of the first data set.
 ///
-/// Use [`parse_str_with`] to state the port count explicitly. Reading from
+/// A data set holds `1 + 2n²` values, which names `n` exactly — so this
+/// works for any port count, wrapped across lines or not. It fails only if
+/// the first data set is itself malformed, since then there is no `n` to
+/// find; use [`parse_str_with`] to state the count explicitly. Reading from
 /// disk instead? [`parse_file`] additionally takes the `.sNp` extension into
 /// account.
 pub fn parse_str(input: &str) -> Result<Network, Error> {
@@ -159,14 +165,19 @@ mod tests {
 
     #[test]
     fn explicit_options_override_inference() {
-        // A 2-port line read as anything else fails the value-count check,
-        // which proves the stated count was the one used.
+        // Left to itself this line reads as a complete 2-port data set. Told
+        // to expect a 3-port, the parser must instead wait for 19 values and
+        // report the shortfall — which proves the stated count was the one
+        // used, not the inferred one.
         let input = "# GHZ S RI R 50\n1.0 0 0 0 0 0 0 0 0\n";
         let opts = ParseOptions::new().nports(3);
         assert!(matches!(
             parse_str_with(input, &opts),
             Err(Error::Parse {
-                kind: ParseErrorKind::UnsupportedPortCount(3),
+                kind: ParseErrorKind::WrongValueCount {
+                    expected: 19,
+                    found: 9
+                },
                 ..
             })
         ));

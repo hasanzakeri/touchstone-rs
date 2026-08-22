@@ -6,8 +6,16 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
+      # tests/data holds verbatim tool output. Trailing whitespace and a
+      # missing final newline are part of what a real exporter emits -- the
+      # Skyworks files in the local harness end their rows with tabs -- so a
+      # fixture that has been tidied is no longer evidence of what we can
+      # read. Both hooks skip it; the README there documents each file's
+      # provenance instead.
       - id: trailing-whitespace
+        exclude: ^tests/data/
       - id: end-of-file-fixer
+        exclude: ^tests/data/
       - id: check-yaml
       - id: check-toml
       - id: check-merge-conflict

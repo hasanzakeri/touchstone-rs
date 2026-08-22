@@ -1,4 +1,4 @@
-"""Reading Touchstone v1, 2-port, RI files through the Python bindings.
+"""Reading Touchstone v1 files through the Python bindings.
 
 These tests exercise the *binding*, not the grammar: the Rust integration
 suite in crates/touchstone-core/tests/parse_v1.rs owns the spec matrix.
@@ -16,6 +16,10 @@ import touchstone_rs as ts
 # A unilateral 2-port: S21 is large, S12 nearly zero, and S11 != S22. Written
 # in file order, which spec v1.1 §3 defines as S11 S21 S12 S22.
 UNILATERAL = "# MHZ S RI R 50\n1.0  0.1 0.2  9.0 9.1  0.01 0.02  0.3 0.4\n"
+
+# Committed fixtures, for the tests that need a real tool's output rather
+# than a hand-written string. See tests/data/README.md for provenance.
+DATA = Path(__file__).resolve().parents[1] / "data"
 
 
 def write(tmp_path: Path, text: str, name: str = "device.s2p") -> Path:
@@ -99,9 +103,60 @@ def test_parse_errors_carry_their_line_number(tmp_path: Path) -> None:
         ts.read(write(tmp_path, text))
 
 
-def test_an_unsupported_format_says_what_is_supported(tmp_path: Path) -> None:
-    with pytest.raises(ts.TouchstoneError, match="only ri is supported"):
-        ts.read(write(tmp_path, "# GHZ S MA R 50\n1.0 0 0 0 0 0 0 0 0\n"))
+def test_an_unsupported_parameter_says_what_is_supported(tmp_path: Path) -> None:
+    with pytest.raises(ts.TouchstoneError, match="only s-parameters are supported"):
+        ts.read(write(tmp_path, "# GHZ Y RI R 50\n1.0 0 0 0 0 0 0 0 0\n"))
+
+
+def test_a_real_multiport_export_crosses_into_numpy_with_the_right_shape() -> None:
+    # A real 16-port ADS export: 64 lines per data set, and a single matrix
+    # row spans four of them. The array shape is the proof that the port
+    # count survived the crossing into NumPy, not just the parse.
+    net = ts.read(DATA / "ads_asymmetric_16port_ri.s16p")
+
+    assert net.nports == 16
+    assert net.s.shape == (10, 16, 16)
+    assert net.z0.shape == (16,)
+    assert net.s.dtype == np.complex128
+    assert repr(net) == "<Network 16-port, 10 frequency points>"
+
+    # Non-reciprocal by construction, so a transpose anywhere in the stack is
+    # visible here. S(1,16) closes row 1 on the data set's fourth line;
+    # S(16,1) opens row 16 on its 61st.
+    assert net.s[0, 0, 15] == 0.0581396322 - 0.0160554818j
+    assert net.s[0, 15, 0] == 0.24924568 - 0.0646806443j
+    assert net.s[0, 0, 15] != net.s[0, 15, 0], "the fixture must not be reciprocal"
+
+
+def test_a_real_multiport_export_agrees_across_formats() -> None:
+    # The same device written three ways. Nothing here is hand-computed, so a
+    # conversion bug cannot be hidden by a matching expectation.
+    ri = ts.read(DATA / "ads_asymmetric_4port_ri.s4p")
+    for name in ("ma", "db"):
+        other = ts.read(DATA / f"ads_asymmetric_4port_{name}.s4p")
+        np.testing.assert_array_equal(other.f, ri.f, err_msg=name)
+        # 1e-7 is the files' nine significant figures talking, not the
+        # conversion arithmetic.
+        np.testing.assert_allclose(other.s, ri.s, atol=1e-7, err_msg=name)
+
+
+def test_a_one_port_file_reads_as_a_one_by_one_matrix(tmp_path: Path) -> None:
+    net = ts.read(write(tmp_path, "# GHZ S MA R 50\n1.0 0.5 90\n", name="load.s1p"))
+    assert net.nports == 1
+    assert net.s.shape == (1, 1, 1)
+    assert net.s[0, 0, 0] == pytest.approx(0.5j)
+
+
+def test_db_and_ma_files_reach_numpy_as_complex_values(tmp_path: Path) -> None:
+    # The formats differ only on disk; what arrives is always complex128.
+    ma = ts.read(write(tmp_path, "# GHZ S MA R 50\n1.0  2 90  1 180  0.5 0  1 -90\n"))
+    db = ts.read(write(tmp_path, "# GHZ S DB R 50\n1.0  20 0  0 0  -20 0  -20 180\n"))
+
+    assert ma.s.dtype == np.complex128
+    assert db.s.dtype == np.complex128
+    assert ma.s[0, 0, 0] == pytest.approx(2j)
+    assert db.s[0, 0, 0] == pytest.approx(10 + 0j)
+    assert db.s[0, 0, 1] == pytest.approx(0.1 + 0j), "S12, the third pair"
 
 
 def test_a_noise_section_is_reported_as_such(tmp_path: Path) -> None:
