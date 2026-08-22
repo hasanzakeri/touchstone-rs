@@ -8,9 +8,10 @@
 //! This version reads Touchstone 1.0 files holding S-parameters in any of
 //! the three value formats, at any port count — including the wrapped
 //! multi-line layout that spec v1.1 §3 prescribes for 3-port and larger
-//! networks. Other parameter types (`Y`/`Z`/`G`/`H`) and the 2-port noise
-//! section are rejected with an error that names the limit. Parsing is
-//! strict by default: see
+//! networks — and the optional noise-parameter section a 2-port file may
+//! append, which arrives in [`Network::noise`]. Other parameter types
+//! (`Y`/`Z`/`G`/`H`) are rejected with an error that names the limit.
+//! Parsing is strict by default: see
 //! `docs/adr/0004-strict-parsing-with-explicit-tolerances.md`.
 //!
 //! ```

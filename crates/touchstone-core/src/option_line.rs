@@ -173,7 +173,8 @@ mod tests {
 
     #[test]
     fn extra_whitespace_and_tabs_are_ignored() {
-        // Matches the spacing a real Skyworks export uses.
+        // The runs of spaces and the trailing one are what real vendor
+        // exports write; the tab form is what several instruments emit.
         assert_eq!(parse("  HZ   S   DB   R     50.00 ").resistance, 50.0);
         assert_eq!(parse("\tGHZ\tS\tRI\tR\t50").format, Format::Ri);
     }

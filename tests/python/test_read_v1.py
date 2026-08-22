@@ -159,13 +159,58 @@ def test_db_and_ma_files_reach_numpy_as_complex_values(tmp_path: Path) -> None:
     assert db.s[0, 0, 1] == pytest.approx(0.1 + 0j), "S12, the third pair"
 
 
-def test_a_noise_section_is_reported_as_such(tmp_path: Path) -> None:
+def test_a_noise_section_arrives_as_four_parallel_arrays(tmp_path: Path) -> None:
     text = (
         "# GHZ S RI R 50\n"
         "2.0 0 0 0 0 0 0 0 0\n"
         "22.0 0 0 0 0 0 0 0 0\n"
         "! NOISE PARAMETERS\n"
-        "4.0 0.7 0.64 69.0 0.38\n"
+        "4.0 0.75 0.62 61.0 0.35\n"
+        "18.0 2.55 0.44 -37.0 0.42\n"
     )
-    with pytest.raises(ts.TouchstoneError, match="noise parameter section"):
+    noise = ts.read(write(tmp_path, text)).noise
+
+    assert noise is not None
+    assert noise.f.dtype == np.float64
+    assert noise.nfmin_db.dtype == np.float64
+    assert noise.gamma_opt.dtype == np.complex128
+    assert noise.rn.dtype == np.float64
+    for array in (noise.f, noise.nfmin_db, noise.gamma_opt, noise.rn):
+        assert array.shape == (2,)
+
+    # Hz here as everywhere, and on a grid of its own: these two points are
+    # not the frequencies the S-data was sampled at.
+    np.testing.assert_array_equal(noise.f, [4e9, 18e9])
+    np.testing.assert_array_equal(noise.nfmin_db, [0.75, 2.55])
+    # Normalized to the option line's R, exactly as written -- not ohms.
+    np.testing.assert_array_equal(noise.rn, [0.35, 0.42])
+    # 0.62 <61 deg: magnitude-and-angle even in an RI file (spec v1.1 3 p10).
+    assert noise.gamma_opt[0] == pytest.approx(0.3005819646 + 0.5422642184j)
+
+
+def test_a_real_export_with_noise_reads_both_of_its_sections() -> None:
+    net = ts.read(DATA / "ads_varying_noise_2port_ri.s2p")
+
+    assert net.f.shape == (10,)
+    assert net.s.shape == (10, 2, 2)
+    noise = net.noise
+    assert noise is not None
+    assert noise.f.shape == (10,)
+    assert noise.gamma_opt[0] == pytest.approx(0.1739795244 + 0.8109449251j)
+
+
+def test_a_file_without_noise_reports_none() -> None:
+    # The truncated sibling of the file above: same device, section removed.
+    assert ts.read(DATA / "ads_unilateral_2port_ri.s2p").noise is None
+
+
+def test_a_malformed_noise_line_names_the_section_and_its_line(tmp_path: Path) -> None:
+    text = (
+        "# GHZ S RI R 50\n"
+        "2.0 0 0 0 0 0 0 0 0\n"
+        "22.0 0 0 0 0 0 0 0 0\n"
+        "4.0 0.75 0.62 61.0 0.35\n"
+        "18.0 2.55 0.44 -37.0\n"
+    )
+    with pytest.raises(ts.TouchstoneError, match="line 5: .*noise parameter line"):
         ts.read(write(tmp_path, text))
