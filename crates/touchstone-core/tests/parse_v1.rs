@@ -253,11 +253,20 @@ fn an_explicit_port_count_agreeing_with_the_data_is_accepted() {
 
 // ------------------------------------------------ port counts and wrapping
 
-/// Index-encoded matrix entries: the real part of S(row, col) is
-/// `row*10 + col`, one-based, so a transposed or mis-framed read is visible
-/// at a glance instead of hiding behind plausible numbers.
-fn entry(row: usize, col: usize) -> f64 {
-    ((row + 1) * 10 + (col + 1)) as f64
+/// Index-encoded matrix entries, so a transposed or mis-framed read is
+/// visible at a glance instead of hiding behind plausible numbers. The real
+/// part of S(row, col) at frequency `fi` reads back as `fi`, `row` and `col`
+/// spelled out: point 2's S(3,4) is `200304`.
+///
+/// **Every position must encode to a distinct value**, or the helper stops
+/// being able to detect the thing it exists to detect. Two digits per index
+/// is not enough — at eleven ports and up, `row*10 + col` collides (S(1,11)
+/// and S(2,1) both give 21), and the 33-port test below would then accept a
+/// swap between exactly those positions. Three digits per index, with the
+/// frequency above both, is unique for every port count this suite reaches.
+fn entry(fi: usize, row: usize, col: usize) -> f64 {
+    assert!(row < 999 && col < 999, "index encoding needs a wider field");
+    (fi * 1_000_000 + (row + 1) * 1_000 + (col + 1)) as f64
 }
 
 /// Render an `n`-port file the way spec v1.1 §3 p9 prescribes: each matrix
@@ -273,9 +282,7 @@ fn conformant_multiport(nports: usize, freqs: &[f64]) -> String {
                     line.push_str(&freq.to_string());
                 }
                 for &col in cols {
-                    // Offset each frequency so a data set boundary that slips
-                    // by one point cannot go unnoticed.
-                    line.push_str(&format!(" {} 0", entry(row, col) + fi as f64 * 1000.0));
+                    line.push_str(&format!(" {} 0", entry(fi, row, col)));
                 }
                 out.push_str(&line);
                 out.push('\n');
@@ -291,7 +298,7 @@ fn assert_matrix_is_row_major(net: &Network, freqs: usize) {
             for col in 0..net.nports {
                 assert_eq!(
                     net.at(fi, row, col),
-                    Complex64::new(entry(row, col) + fi as f64 * 1000.0, 0.0),
+                    Complex64::new(entry(fi, row, col), 0.0),
                     "S({},{}) at frequency {fi}",
                     row + 1,
                     col + 1
@@ -353,16 +360,17 @@ fn an_eight_port_set_wraps_each_matrix_row_across_two_lines() {
 /// both. Neither may disturb a data set in progress.
 #[test]
 fn blank_lines_and_row_comments_do_not_break_a_wrapped_set() {
+    // Values follow `entry`: 1002 is S(1,2) at point 0, 1001002 at point 1.
     let net = ok(concat!(
         "# GHZ S RI R 50\n",
-        "1.0  11 0  12 0  13 0   ! frequency line 1\n",
-        "     21 0  22 0  23 0\n",
-        "     31 0  32 0  33 0\n",
+        "1.0  1001 0  1002 0  1003 0   ! frequency line 1\n",
+        "     2001 0  2002 0  2003 0\n",
+        "     3001 0  3002 0  3003 0\n",
         "\n",
-        "2.0  1011 0  1012 0  1013 0   ! frequency line 2\n",
+        "2.0  1001001 0  1001002 0  1001003 0   ! frequency line 2\n",
         "\n",
-        "     1021 0  1022 0  1023 0\n",
-        "     1031 0  1032 0  1033 0\n",
+        "     1002001 0  1002002 0  1002003 0\n",
+        "     1003001 0  1003002 0  1003003 0\n",
     ));
     assert_eq!(net.nports, 3);
     assert_matrix_is_row_major(&net, 2);
@@ -375,15 +383,16 @@ fn blank_lines_and_row_comments_do_not_break_a_wrapped_set() {
 #[test]
 fn a_set_wrapped_against_the_spec_still_reads_correctly() {
     // Everything on one line, then the same data broken at arbitrary points.
+    // Values follow `entry`: 2003 is S(2,3) at point 0.
     let one_line = ok(concat!(
         "# GHZ S RI R 50\n",
-        "1.0 11 0 12 0 13 0 21 0 22 0 23 0 31 0 32 0 33 0\n",
+        "1.0 1001 0 1002 0 1003 0 2001 0 2002 0 2003 0 3001 0 3002 0 3003 0\n",
     ));
     let ragged = ok(concat!(
         "# GHZ S RI R 50\n",
-        "1.0 11 0 12 0\n",
-        "13 0 21 0 22 0 23 0 31 0 32 0\n",
-        "33 0\n",
+        "1.0 1001 0 1002 0\n",
+        "1003 0 2001 0 2002 0 2003 0 3001 0 3002 0\n",
+        "3003 0\n",
     ));
     assert_eq!(one_line.nports, 3);
     assert_eq!(one_line.s, ragged.s);
@@ -408,6 +417,64 @@ fn a_two_port_set_split_after_two_pairs_is_not_mistaken_for_noise() {
     assert_eq!(net.at(0, 0, 1), Complex64::new(0.01, 0.02), "S12");
 }
 
+/// A port count arrives unvetted from the filename, so `x.s99999999999p`
+/// hands the parser 10¹¹ ports. `1 + 2n²` overflows there, and left
+/// unchecked it wraps: the reported size becomes nonsense, and a wrapped
+/// size that happened to match the accumulated length would index past the
+/// end of the value slice.
+///
+/// This is arithmetic, not the policy ceiling ADR 0006 declined to impose —
+/// a data set that does not fit in a `usize` cannot describe a file that
+/// fits on a disk.
+#[test]
+fn a_port_count_too_large_to_describe_a_data_set_is_rejected() {
+    let dir = std::env::temp_dir().join(format!(
+        "touchstone_rs_m2_huge_ports_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("wild.s99999999999p");
+    std::fs::write(&path, MINIMAL).expect("write");
+
+    let err = parse_file(&path).expect_err("10^11 ports cannot describe a data set");
+    assert!(
+        matches!(
+            err,
+            Error::Parse {
+                kind: ParseErrorKind::UnusablePortCount {
+                    nports: 99_999_999_999
+                },
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    // Reported at the first data line, not after reading the whole file.
+    assert!(matches!(err, Error::Parse { line: 2, .. }), "got {err:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Zero ports is not a network. Left through, it yields a `Network` with an
+/// empty `s` whose `at()` panics on every index — a broken value handed back
+/// as a success.
+#[test]
+fn a_zero_port_count_is_rejected_rather_than_producing_an_empty_network() {
+    let opts = ParseOptions::new().nports(0);
+    let err =
+        parse_str_with("# GHZ S RI R 50\n1.0\n", &opts).expect_err("0 ports is not a network");
+    assert!(
+        matches!(
+            err,
+            Error::Parse {
+                kind: ParseErrorKind::UnusablePortCount { nports: 0 },
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(err.to_string(), "line 2: port count must be at least 1");
+}
+
 /// Nothing in the format caps the port count — spec v1.1 §3 p4 says
 /// "the Touchstone format supports matrixes of unlimited size", against
 /// Keysight's documented 5–99 and the `touchstone` crate's 32.
@@ -424,7 +491,11 @@ fn a_port_count_beyond_every_other_readers_ceiling_is_accepted() {
 /// truncated file report a shortfall rather than an unsolvable shape.
 #[test]
 fn the_extension_supplies_a_port_count_the_data_alone_could_not_fix() {
-    let dir = std::env::temp_dir().join("touchstone_rs_m2_extension");
+    // The process id keeps two concurrent `cargo test` runs on one machine
+    // from sharing this directory — and, worse, from `remove_dir_all`-ing it
+    // out from under each other mid-test.
+    let dir =
+        std::env::temp_dir().join(format!("touchstone_rs_m2_extension_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join("truncated.s4p");
 
@@ -532,13 +603,10 @@ fn an_empty_or_dataless_file_is_an_error() {
         kind("! just a comment\n"),
         ParseErrorKind::MissingOptionLine
     );
-    assert_eq!(
-        kind("# GHZ S RI R 50\n"),
-        ParseErrorKind::UnexpectedData("no data lines".into())
-    );
+    assert_eq!(kind("# GHZ S RI R 50\n"), ParseErrorKind::NoDataLines);
     assert_eq!(
         kind("# GHZ S RI R 50\n! nothing but talk\n"),
-        ParseErrorKind::UnexpectedData("no data lines".into())
+        ParseErrorKind::NoDataLines
     );
 }
 
@@ -549,7 +617,7 @@ fn an_empty_or_dataless_file_is_an_error() {
 fn a_dataless_file_points_at_the_option_line_not_line_one() {
     let (line, kind) = fails("! preface\n! more preface\n# GHZ S RI R 50\n! trailing talk\n");
     assert_eq!(line, 3, "the option line is on line 3, not line 1");
-    assert_eq!(kind, ParseErrorKind::UnexpectedData("no data lines".into()));
+    assert_eq!(kind, ParseErrorKind::NoDataLines);
 }
 
 #[test]
@@ -732,6 +800,30 @@ fn values_that_stay_non_finite_after_conversion_are_rejected() {
     );
 }
 
+/// A rejected frequency is quoted as the file spells it, not as the `f64` it
+/// parsed to. `1e400` overflows to infinity, and reporting "inf" would send
+/// the reader searching their file for a word that is not in it — the whole
+/// value of quoting the token is that it can be found.
+#[test]
+fn a_rejected_frequency_is_quoted_as_the_file_spells_it() {
+    assert_eq!(
+        kind("# GHZ S RI R 50\n1e400 0 0 0 0 0 0 0 0\n"),
+        ParseErrorKind::InvalidNumber("1e400".into())
+    );
+    // Also when the token is finite but the unit scaling takes it past the
+    // end of the range.
+    assert_eq!(
+        kind("# GHZ S RI R 50\n1e308 0 0 0 0 0 0 0 0\n"),
+        ParseErrorKind::InvalidNumber("1e308".into())
+    );
+    // And on a wrapped data set, where the frequency is on an earlier line
+    // than the one that completes the set.
+    assert_eq!(
+        kind("# GHZ S RI R 50\n1e400 1 0 2 0 3 0\n4 0 5 0 6 0\n7 0 8 0 9 0\n"),
+        ParseErrorKind::InvalidNumber("1e400".into())
+    );
+}
+
 /// The counterpart: `-inf` in a `DB` magnitude column is not a bad token at
 /// all. It is how a real ADS export writes an entry whose magnitude is
 /// exactly zero, and `10^(-inf/20)` is `0`. Rejecting it would make the
@@ -793,9 +885,13 @@ fn a_bad_option_line_is_reported_at_its_own_line() {
 
 /// A unilateral 2-port simulated in Keysight ADS: S12 is zero, S21 is large,
 /// S11 differs from S22 — the ordering guard's real-world counterpart. See
-/// `tests/data/README.md` for provenance. Read via `include_str!` rather
-/// than at runtime, so `cargo package`/`cargo test --workspace` never
-/// depends on the file surviving a move.
+/// `tests/data/README.md` for provenance.
+///
+/// `include_str!` resolves relative to *this file* at compile time, so the
+/// test does not care what directory it is run from — which `fs::read` would.
+/// The path leaves the crate, though, so these fixtures would not travel in
+/// a packaged `touchstone-core`; see the release-engineering note in
+/// BLUEPRINT.md before the first crates.io publish.
 const REAL_FILE: &str = include_str!("../../../tests/data/ads_unilateral_2port_ri.s2p");
 
 #[test]
@@ -921,13 +1017,18 @@ mod one_port {
     #[test]
     fn the_frequency_unit_changes_the_file_but_not_the_result() {
         let ghz = ok(MA_GHZ);
-        for (unit, other) in [("mhz", ok(MA_MHZ)), ("hz", ok(MA_HZ))] {
+        assert_eq!(ghz.metadata.freq_unit, FreqUnit::GHz);
+
+        for (unit, expected_unit, other) in [
+            ("mhz", FreqUnit::MHz, ok(MA_MHZ)),
+            ("hz", FreqUnit::Hz, ok(MA_HZ)),
+        ] {
+            // The metadata still records what the file said, even though the
+            // arrays no longer differ.
+            assert_eq!(other.metadata.freq_unit, expected_unit, "{unit}: metadata");
             assert_eq!(other.freq_hz, ghz.freq_hz, "{unit}: frequencies");
             assert_eq!(other.s, ghz.s, "{unit}: values");
         }
-        assert_eq!(ghz.metadata.freq_unit, FreqUnit::GHz);
-        assert_eq!(ok(MA_MHZ).metadata.freq_unit, FreqUnit::MHz);
-        assert_eq!(ok(MA_HZ).metadata.freq_unit, FreqUnit::Hz);
     }
 
     /// `5.000000000e-02` and `0.05` are the same number. The exponent form

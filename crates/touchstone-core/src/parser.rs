@@ -74,6 +74,11 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
             .as_ref()
             .ok_or_else(|| err(line.number, ParseErrorKind::DataBeforeOptionLine))?;
 
+        // `content` is trimmed and non-empty here, so there is at least one
+        // token. Kept as a `&str` borrowed from the input: it is only read
+        // when a frequency turns out to be unusable.
+        let first_token = line.content.split_whitespace().next().unwrap_or_default();
+
         values.clear();
         for token in line.content.split_whitespace() {
             // Non-finite tokens are *not* rejected here. `-inf` is how a real
@@ -90,7 +95,7 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
             values.push(value);
         }
 
-        sets.push_line(&values, line.number, opts_ref)?;
+        sets.push_line(&values, first_token, line.number, opts_ref)?;
     }
 
     let Some(opts_ref) = options else {
@@ -100,10 +105,7 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
 
     if sets.freq_hz.is_empty() {
         let line = option_line_number.expect("set alongside `options`, checked just above");
-        return Err(err(
-            line,
-            ParseErrorKind::UnexpectedData("no data lines".to_string()),
-        ));
+        return Err(err(line, ParseErrorKind::NoDataLines));
     }
     let n = sets.nports.expect("set alongside the first data set");
 
@@ -146,7 +148,7 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
 /// exists to read, which wrap inconsistently; trusting the blank lines that
 /// Keysight's examples put between blocks would break on the many files that
 /// omit them.
-struct DataSets {
+struct DataSets<'a> {
     freq_hz: Vec<f64>,
     s: Vec<Complex64>,
     /// `None` until the first complete data set fixes it, unless the caller
@@ -157,9 +159,17 @@ struct DataSets {
     /// Source line `block` started on, so an error about a wrapped data set
     /// points at its beginning rather than at whichever line completed it.
     block_line: usize,
+    /// The source token that became `block[0]`.
+    ///
+    /// Borrowed from the input rather than copied, so carrying it costs
+    /// nothing per data set. It exists so a rejected frequency is quoted as
+    /// the file spells it: `1e400` parses to `inf`, and reporting the parsed
+    /// `f64` would tell the reader to search their file for a word that is
+    /// not in it.
+    frequency_token: &'a str,
 }
 
-impl DataSets {
+impl<'a> DataSets<'a> {
     fn new(nports: Option<usize>) -> Self {
         DataSets {
             freq_hz: Vec::new(),
@@ -167,6 +177,7 @@ impl DataSets {
             nports,
             block: Vec::new(),
             block_line: 0,
+            frequency_token: "",
         }
     }
 
@@ -176,8 +187,15 @@ impl DataSets {
         self.freq_hz.is_empty() && self.block.is_empty()
     }
 
-    /// Take one data line's values.
-    fn push_line(&mut self, values: &[f64], line: usize, opts: &Options) -> Result<(), Error> {
+    /// Take one data line's values. `first_token` is that line's first token
+    /// as it appears in the source, used only for error messages.
+    fn push_line(
+        &mut self,
+        values: &[f64],
+        first_token: &'a str,
+        line: usize,
+        opts: &Options,
+    ) -> Result<(), Error> {
         if values.len() % 2 == 1 && !self.block.is_empty() {
             // An odd count opens a new data set, so whatever is buffered is
             // as complete as it will ever be.
@@ -185,6 +203,7 @@ impl DataSets {
         }
         if self.block.is_empty() {
             self.block_line = line;
+            self.frequency_token = first_token;
         }
         self.block.extend_from_slice(values);
 
@@ -192,10 +211,14 @@ impl DataSets {
         // for the next odd line to notice a completed set would only push
         // errors further from their cause — and would let a file whose *last*
         // set is truncated slip through to the end before failing.
-        if let Some(n) = self.nports
-            && self.block.len() >= values_per_point(n)
-        {
-            self.flush(opts)?;
+        //
+        // This is also where a port count that cannot describe a data set is
+        // caught, on the first data line rather than after reading the file.
+        if let Some(n) = self.nports {
+            let expected = values_per_set(n, line)?;
+            if self.block.len() >= expected {
+                self.flush(opts)?;
+            }
         }
         Ok(())
     }
@@ -245,7 +268,7 @@ impl DataSets {
             return Err(err(line, ParseErrorKind::NoiseSectionUnsupported));
         }
 
-        let expected = values_per_point(n);
+        let expected = values_per_set(n, line)?;
         if self.block.len() != expected {
             return Err(err(
                 line,
@@ -260,7 +283,7 @@ impl DataSets {
         if !frequency.is_finite() {
             return Err(err(
                 line,
-                ParseErrorKind::InvalidNumber(self.block[0].to_string()),
+                ParseErrorKind::InvalidNumber(self.frequency_token.to_string()),
             ));
         }
         if let Some(&previous) = self.freq_hz.last()
@@ -289,8 +312,28 @@ const NOISE_VALUES_PER_LINE: usize = 5;
 
 /// Values in one data set for an `n`-port network: a frequency plus one
 /// pair per matrix entry.
-fn values_per_point(n: usize) -> usize {
-    1 + 2 * n * n
+///
+/// `None` for a port count that cannot describe a data set at all: zero, or
+/// one so large that `1 + 2n²` overflows a `usize`.
+///
+/// This is not the arbitrary ceiling ADR 0006 declined to impose. Nothing
+/// vets the count before it arrives — `parse_file` takes it from the
+/// filename, so `x.s99999999999p` hands over 10¹¹ ports — and a count whose
+/// data set will not fit in a `usize` cannot describe a file that fits on a
+/// disk either. Left unchecked the multiplication wraps, and a wrapped
+/// `expected` that happens to match the accumulated length would send
+/// [`push_point`] indexing past the end of its slice.
+fn values_per_point(n: usize) -> Option<usize> {
+    if n == 0 {
+        return None;
+    }
+    n.checked_mul(n)?.checked_mul(2)?.checked_add(1)
+}
+
+/// [`values_per_point`], or the error to report for a port count that cannot
+/// describe a data set.
+fn values_per_set(n: usize, line: usize) -> Result<usize, Error> {
+    values_per_point(n).ok_or_else(|| err(line, ParseErrorKind::UnusablePortCount { nports: n }))
 }
 
 /// Port count implied by the size of one complete data set.
@@ -318,7 +361,7 @@ fn nports_from_data_set(len: usize) -> Option<usize> {
 /// Reject parameter types outside this version's scope.
 ///
 /// Spec v1.1 §3 permits `S`/`Y`/`Z`/`G`/`H` at every port count; we read `S`
-/// only. Formats are no longer checked here — all three are supported.
+/// only. The value format is not restricted: all three convert.
 fn check_option_scope(opts: &Options, line: usize) -> Result<(), Error> {
     if opts.parameter != Parameter::S {
         return Err(err(
@@ -410,20 +453,50 @@ mod tests {
 
     #[test]
     fn values_per_point_counts_a_frequency_plus_one_pair_per_entry() {
-        assert_eq!(values_per_point(1), 3);
-        assert_eq!(values_per_point(2), 9);
-        assert_eq!(values_per_point(4), 33);
-        assert_eq!(values_per_point(16), 513);
+        assert_eq!(values_per_point(1), Some(3));
+        assert_eq!(values_per_point(2), Some(9));
+        assert_eq!(values_per_point(4), Some(33));
+        assert_eq!(values_per_point(16), Some(513));
+    }
+
+    /// The port count is not vetted before it reaches here: `parse_file`
+    /// takes it from the filename. Unchecked, `1 + 2n²` wraps, and a wrapped
+    /// size that happened to match the accumulated length would send
+    /// `push_point` past the end of its slice.
+    #[test]
+    fn a_port_count_that_cannot_describe_a_data_set_is_rejected_not_wrapped() {
+        // Zero ports is not a network, and would yield a `Network` whose
+        // `at()` panics on every index.
+        assert_eq!(values_per_point(0), None);
+
+        // Both overflow points, written against `usize::BITS` so the test
+        // means the same thing on a 32-bit target.
+        //
+        // `n * n` overflows from 2^(bits/2) up.
+        let square_overflows = 1usize << (usize::BITS / 2);
+        assert!(square_overflows.checked_mul(square_overflows).is_none());
+        assert_eq!(values_per_point(square_overflows), None);
+        assert_eq!(values_per_point(usize::MAX), None);
+
+        // One below that, `n * n` fits and the *doubling* is what overflows
+        // — the step a `checked_mul` on the square alone would miss.
+        let doubling_overflows = square_overflows - 1;
+        assert!(
+            doubling_overflows
+                .checked_mul(doubling_overflows)
+                .is_some_and(|sq| sq.checked_mul(2).is_none())
+        );
+        assert_eq!(values_per_point(doubling_overflows), None);
+
+        // Ordinary counts stay exact rather than clamped.
+        assert_eq!(values_per_point(1000), Some(2_000_001));
     }
 
     #[test]
     fn a_data_set_length_names_its_port_count() {
         for n in 1..=32usize {
-            assert_eq!(
-                nports_from_data_set(values_per_point(n)),
-                Some(n),
-                "{n}-port"
-            );
+            let len = values_per_point(n).expect("small counts are usable");
+            assert_eq!(nports_from_data_set(len), Some(n), "{n}-port");
         }
     }
 

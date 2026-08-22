@@ -34,8 +34,10 @@ pub enum Error {
 #[non_exhaustive]
 pub enum ParseErrorKind {
     InvalidOptionLine(String),
+    /// A token that is not a usable number, quoted as the file spells it.
     InvalidNumber(String),
-    UnexpectedData(String),
+    /// The file carried an option line but no network data.
+    NoDataLines,
     /// The file has no option line at all. Spec v1.1 §3 requires one; the
     /// documented defaults cover *omitted parts*, not an absent line.
     MissingOptionLine,
@@ -54,6 +56,13 @@ pub enum ParseErrorKind {
     /// unless the caller can supply the port count another way.
     IndeterminatePortCount {
         found: usize,
+    },
+    /// A port count that cannot describe a data set: zero, or one so large
+    /// that `1 + 2n²` overflows. Reachable because the count can come from a
+    /// filename or a caller without ever being vetted — `x.s99999999999p`
+    /// names 10¹¹ ports. Not a policy ceiling; see ADR 0006.
+    UnusablePortCount {
+        nports: usize,
     },
     /// A value pair converted to something that is not a finite complex
     /// number. Checked after conversion, not on the raw token: `-inf` in a
@@ -83,7 +92,7 @@ impl fmt::Display for ParseErrorKind {
         match self {
             ParseErrorKind::InvalidOptionLine(s) => write!(f, "invalid option line: {s}"),
             ParseErrorKind::InvalidNumber(s) => write!(f, "invalid number: {s}"),
-            ParseErrorKind::UnexpectedData(s) => write!(f, "unexpected data: {s}"),
+            ParseErrorKind::NoDataLines => write!(f, "no data lines"),
             ParseErrorKind::MissingOptionLine => {
                 write!(
                     f,
@@ -99,6 +108,14 @@ impl fmt::Display for ParseErrorKind {
                 "cannot determine the port count: a data set of {found} values \
                  is not 1 + 2n^2 for any n (name the file '.sNp' or pass an \
                  explicit port count)"
+            ),
+            ParseErrorKind::UnusablePortCount { nports: 0 } => {
+                write!(f, "port count must be at least 1")
+            }
+            ParseErrorKind::UnusablePortCount { nports } => write!(
+                f,
+                "port count {nports} is too large: one data set would hold \
+                 1 + 2*{nports}^2 values, which does not fit in memory"
             ),
             ParseErrorKind::NonFiniteValue { first, second } => write!(
                 f,
@@ -211,5 +228,37 @@ mod tests {
             err.to_string(),
             "line 7: value pair 'NaN 0' is not a finite complex number"
         );
+    }
+
+    /// An unusable port count has two quite different causes, and one
+    /// message for both would explain neither.
+    #[test]
+    fn an_unusable_port_count_says_which_way_it_is_unusable() {
+        let err = Error::Parse {
+            line: 2,
+            kind: ParseErrorKind::UnusablePortCount { nports: 0 },
+        };
+        assert_eq!(err.to_string(), "line 2: port count must be at least 1");
+
+        let err = Error::Parse {
+            line: 2,
+            kind: ParseErrorKind::UnusablePortCount {
+                nports: 99_999_999_999,
+            },
+        };
+        assert_eq!(
+            err.to_string(),
+            "line 2: port count 99999999999 is too large: one data set would hold \
+             1 + 2*99999999999^2 values, which does not fit in memory"
+        );
+    }
+
+    #[test]
+    fn a_file_with_an_option_line_but_no_data_says_so_plainly() {
+        let err = Error::Parse {
+            line: 3,
+            kind: ParseErrorKind::NoDataLines,
+        };
+        assert_eq!(err.to_string(), "line 3: no data lines");
     }
 }
