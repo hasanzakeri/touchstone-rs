@@ -1,24 +1,38 @@
-//! The option line: `# <freq unit> <parameter> <format> R <n>`.
+//! The option line: `# <freq unit> <parameter> <format> R <n1> [… <np>]`.
 //!
 //! Spec v1.1 §3. Every part is optional and, apart from the leading `#` and
-//! the value that follows `R`, the parts may appear in any order; omitted
+//! the values that follow `R`, the parts may appear in any order; omitted
 //! parts take the documented defaults. Matching is case-insensitive (§2), so
 //! `# hZ s Ri r 50` is as valid as `# HZ S RI R 50`.
 //!
+//! `R` takes **one or more** values. A single value is the reference for every
+//! port; one value per port is what the 2.1 document designates a "Version
+//! 1.1" file, and is the only substantive difference between 1.0 and 1.1
+//! syntax. The list has to be contiguous — the same document makes it the one
+//! exception to the free ordering above — and needs no delimiter, because no
+//! other option-line token parses as a number, so numeric tokens after `R` can
+//! simply be taken until one does not.
+//!
 //! Kept separate from the data parser because it is pure, has by far the
-//! densest test matrix in the crate, and is the one piece the v2 parser will
-//! reuse unchanged — v2 files still carry an option line.
+//! densest test matrix in the crate, and is the one piece the v2 parser reuses
+//! unchanged — v2 files still carry an option line.
 
 use crate::error::{Error, ParseErrorKind};
 use crate::model::{Format, FreqUnit, Parameter};
 
 /// What an option line says, with defaults filled in.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Options {
     pub freq_unit: FreqUnit,
     pub parameter: Parameter,
     pub format: Format,
-    pub resistance: f64,
+    /// Every value given after `R`, in order. Never empty: an option line with
+    /// no `R` at all takes the documented 50 Ω default.
+    ///
+    /// Not checked against the port count here, because the option line is
+    /// read before the port count is known — a v1 file may not state one at
+    /// all until its first data set closes. The parser checks it once it can.
+    pub resistances: Vec<f64>,
 }
 
 impl Default for Options {
@@ -28,7 +42,7 @@ impl Default for Options {
             freq_unit: FreqUnit::GHz,
             parameter: Parameter::S,
             format: Format::Ma,
-            resistance: 50.0,
+            resistances: vec![50.0],
         }
     }
 }
@@ -44,7 +58,7 @@ pub(crate) fn parse_option_line(body: &str, line: usize) -> Result<Options, Erro
     let (mut seen_unit, mut seen_param, mut seen_format, mut seen_resistance) =
         (false, false, false, false);
 
-    let mut tokens = body.split_whitespace();
+    let mut tokens = body.split_whitespace().peekable();
     while let Some(token) = tokens.next() {
         let lower = token.to_ascii_lowercase();
         match lower.as_str() {
@@ -77,22 +91,28 @@ pub(crate) fn parse_option_line(body: &str, line: usize) -> Result<Options, Erro
             }
             "r" => {
                 claim(&mut seen_resistance, "reference resistance", line)?;
-                // `R` is the one token whose value is positional. Real files
+                // `R` is the one token whose values are positional. Real files
                 // separate them generously (`R     50.00`); the glued forms
                 // `R50` and `R=50` are not accepted here.
-                let value = tokens
+                //
+                // The first value is mandatory and is reported by name if it
+                // is not a number — `R abc` is a typo worth pointing at, not a
+                // reason to claim `R` had no value. Any further values are
+                // taken only while they parse, so the list ends at the next
+                // keyword without needing to know what keywords there are.
+                let first = tokens
                     .next()
                     .ok_or_else(|| invalid(line, "'r' given with no value"))?;
-                let ohms: f64 = value.parse().map_err(|_| {
-                    parse_err(line, ParseErrorKind::InvalidNumber(value.to_string()))
+                let ohms: f64 = first.parse().map_err(|_| {
+                    parse_err(line, ParseErrorKind::InvalidNumber(first.to_string()))
                 })?;
-                if !ohms.is_finite() || ohms <= 0.0 {
-                    return Err(invalid(
-                        line,
-                        format!("reference resistance must be a positive number, got '{value}'"),
-                    ));
+                let mut values = vec![check_ohms(ohms, first, line)?];
+                while let Some(&next) = tokens.peek() {
+                    let Ok(ohms) = next.parse::<f64>() else { break };
+                    tokens.next();
+                    values.push(check_ohms(ohms, next, line)?);
                 }
-                opts.resistance = ohms;
+                opts.resistances = values;
             }
             other => {
                 return Err(invalid(line, format!("unknown token '{other}'")));
@@ -101,6 +121,20 @@ pub(crate) fn parse_option_line(body: &str, line: usize) -> Result<Options, Erro
     }
 
     Ok(opts)
+}
+
+/// A reference resistance has to be a positive, finite number of ohms.
+///
+/// `token` is quoted back rather than the parsed value, so `R 1e400` names
+/// what the file actually says instead of the `inf` it became.
+fn check_ohms(ohms: f64, token: &str, line: usize) -> Result<f64, Error> {
+    if !ohms.is_finite() || ohms <= 0.0 {
+        return Err(invalid(
+            line,
+            format!("reference resistance must be a positive number, got '{token}'"),
+        ));
+    }
+    Ok(ohms)
 }
 
 /// Mark a category as seen, rejecting a second occurrence.
@@ -153,7 +187,7 @@ mod tests {
                 freq_unit: FreqUnit::GHz,
                 parameter: Parameter::S,
                 format: Format::Ri,
-                resistance: 50.0,
+                resistances: vec![50.0],
             }
         );
     }
@@ -175,7 +209,7 @@ mod tests {
     fn extra_whitespace_and_tabs_are_ignored() {
         // The runs of spaces and the trailing one are what real vendor
         // exports write; the tab form is what several instruments emit.
-        assert_eq!(parse("  HZ   S   DB   R     50.00 ").resistance, 50.0);
+        assert_eq!(parse("  HZ   S   DB   R     50.00 ").resistances, [50.0]);
         assert_eq!(parse("\tGHZ\tS\tRI\tR\t50").format, Format::Ri);
     }
 
@@ -198,7 +232,7 @@ mod tests {
         assert_eq!(
             parse(" R 100"),
             Options {
-                resistance: 100.0,
+                resistances: vec![100.0],
                 ..Options::default()
             }
         );
@@ -230,9 +264,53 @@ mod tests {
 
     #[test]
     fn resistance_need_not_be_an_integer() {
-        assert_eq!(parse(" R 50.00").resistance, 50.0);
-        assert_eq!(parse(" R 1e2").resistance, 100.0);
-        assert_eq!(parse(" R .5").resistance, 0.5);
+        assert_eq!(parse(" R 50.00").resistances, [50.0]);
+        assert_eq!(parse(" R 1e2").resistances, [100.0]);
+        assert_eq!(parse(" R .5").resistances, [0.5]);
+    }
+
+    /// The 2.1 document's "Version 1.1" option line: one reference resistance
+    /// per port instead of one for all of them. Files using it circulate, and
+    /// before this they were rejected for an `unknown token '75'`.
+    #[test]
+    fn r_takes_one_value_per_port() {
+        assert_eq!(parse(" GHZ S RI R 50 75").resistances, [50.0, 75.0]);
+        assert_eq!(
+            parse(" GHZ S RI R 50 75 100 25").resistances,
+            [50.0, 75.0, 100.0, 25.0]
+        );
+        // Nothing here knows the port count, so nothing here objects to a list
+        // that will not match it. That check belongs to the parser.
+        assert_eq!(parse(" R 1 2 3 4 5 6 7").resistances.len(), 7);
+    }
+
+    /// The list is delimited by the next thing that is not a number, which is
+    /// exact rather than a guess: no unit, parameter or format keyword parses
+    /// as one.
+    #[test]
+    fn the_resistance_list_ends_at_the_next_keyword() {
+        let expected = [50.0, 75.0];
+        assert_eq!(parse(" R 50 75 GHZ").resistances, expected);
+        assert_eq!(parse(" R 50 75 RI S").resistances, expected);
+        assert_eq!(parse(" S R 50 75 MHZ DB").resistances, expected);
+        // And the rest of the line is still read, not swallowed by the list.
+        assert_eq!(parse(" R 50 75 MHZ DB").freq_unit, FreqUnit::MHz);
+        assert_eq!(parse(" R 50 75 MHZ DB").format, Format::Db);
+    }
+
+    /// Every value gets the same scrutiny as a lone one — a negative or zero
+    /// impedance is meaningless wherever it sits in the list, and the message
+    /// names the offending token rather than the position.
+    #[test]
+    fn every_value_in_the_list_must_be_positive() {
+        assert!(matches!(
+            kind(" R 50 -75"),
+            ParseErrorKind::InvalidOptionLine(m) if m.contains("'-75'")
+        ));
+        assert!(matches!(
+            kind(" R 50 75 0"),
+            ParseErrorKind::InvalidOptionLine(m) if m.contains("'0'")
+        ));
     }
 
     #[test]

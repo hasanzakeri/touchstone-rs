@@ -91,11 +91,60 @@ fn reads_a_minimal_two_port_file() {
     assert!(net.noise.is_none());
     assert_eq!(net.s.len(), 4);
 
-    assert_eq!(net.metadata.version, Version::V1);
+    assert_eq!(net.metadata.version, Version::V1_0);
     assert_eq!(net.metadata.freq_unit, FreqUnit::GHz);
     assert_eq!(net.metadata.parameter, Parameter::S);
     assert_eq!(net.metadata.format, Format::Ri);
-    assert_eq!(net.metadata.resistance, 50.0);
+    assert_eq!(net.metadata.resistances, [50.0]);
+}
+
+/// The 2.1 document's "Version 1.1" file: a v1 option line carrying one
+/// reference resistance per port rather than one for all of them.
+///
+/// Nothing in such a file announces itself — 1.x files have no `[Version]`
+/// keyword — so the option line's shape is the only evidence, and `z0` is the
+/// only place the difference shows up in the parsed network.
+mod version_1_1 {
+    use super::*;
+
+    /// A 2-port whose ports are referenced to different impedances. Before
+    /// this was supported the file failed with `unknown token '75'`.
+    const PER_PORT_R: &str = "# GHZ S RI R 50 75\n1.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\n";
+
+    #[test]
+    fn per_port_resistances_reach_z0_in_order() {
+        let net = ok(PER_PORT_R);
+        assert_eq!(net.z0, [50.0, 75.0]);
+        assert_eq!(net.metadata.version, Version::V1_1);
+        assert_eq!(net.metadata.resistances, [50.0, 75.0]);
+    }
+
+    /// A single value still means "this port and every other", which is what
+    /// keeps every 1.0 file in the suite reading exactly as before.
+    #[test]
+    fn one_value_is_still_broadcast_to_every_port() {
+        let net = ok("# GHZ S RI R 75\n1.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\n");
+        assert_eq!(net.z0, [75.0, 75.0]);
+        assert_eq!(net.metadata.version, Version::V1_0);
+    }
+
+    /// The count cannot be checked when the option line is read — a v1 file
+    /// does not state its port count, and here it is not known until the first
+    /// data set closes. The error still points at the option line, because
+    /// that is where the mistake is.
+    #[test]
+    fn a_list_that_does_not_match_the_port_count_names_the_option_line() {
+        let (line, kind) = fails("# GHZ S RI R 50 75 100\n1.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\n");
+        assert_eq!(line, 1, "the option line, not the data line");
+        assert_eq!(
+            kind,
+            ParseErrorKind::WrongResistanceCount {
+                source: "the option line",
+                expected: 2,
+                found: 3,
+            }
+        );
+    }
 }
 
 /// **The ordering guard.** Spec v1.1 §3 writes a 2-port line as

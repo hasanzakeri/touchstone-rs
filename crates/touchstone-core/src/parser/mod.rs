@@ -69,6 +69,36 @@ pub(crate) fn check_option_scope(opts: &Options, line: usize) -> Result<(), Erro
     Ok(())
 }
 
+/// Expand the option line's `R` values into one reference resistance per port.
+///
+/// A single value is the reference for *every* port — the 1.0 rule, and the
+/// v2 rule when `[Reference]` is absent. A list is the 1.1 rule and must name
+/// every port exactly once.
+///
+/// This is the option line's rule only. `[Reference]` does not broadcast:
+/// spec 2.0 p10 requires an argument for every port represented in the data,
+/// so a lone value there is an error rather than a shorthand, and the v2
+/// reader checks that as it collects them.
+pub(crate) fn reference_per_port(
+    declared: &[f64],
+    nports: usize,
+    source: &'static str,
+    line: usize,
+) -> Result<Vec<f64>, Error> {
+    match declared {
+        [single] => Ok(vec![*single; nports]),
+        values if values.len() == nports => Ok(values.to_vec()),
+        values => Err(err(
+            line,
+            ParseErrorKind::WrongResistanceCount {
+                source,
+                expected: nports,
+                found: values.len(),
+            },
+        )),
+    }
+}
+
 /// Build a complex value from an on-disk pair, per spec v1.1 §3 p5 and spec
 /// 2.0 p6 — which describe the three formats in identical terms.
 pub(crate) fn to_complex(a: f64, b: f64, format: Format) -> Complex64 {

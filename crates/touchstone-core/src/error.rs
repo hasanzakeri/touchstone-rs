@@ -105,6 +105,19 @@ pub enum ParseErrorKind {
         column: &'static str,
         value: f64,
     },
+    /// A list of reference resistances that does not have one entry per port.
+    ///
+    /// Reachable two ways, so the message says which: a "Version 1.1" option
+    /// line whose `R` list is the wrong length, or a v2 `[Reference]` keyword
+    /// with the wrong number of arguments. A single option-line value is
+    /// always legal — it is the reference for every port — so this only ever
+    /// fires on a list of two or more.
+    WrongResistanceCount {
+        /// Where the values came from, named as the file spells it.
+        source: &'static str,
+        expected: usize,
+        found: usize,
+    },
     /// A network parameter type this version cannot handle yet.
     UnsupportedParameter(Parameter),
     /// Carriage-return-only line endings, which would collapse the whole
@@ -172,6 +185,15 @@ impl fmt::Display for ParseErrorKind {
             ParseErrorKind::NonFiniteNoiseValue { column, value } => {
                 write!(f, "noise {column} value '{value}' is not a finite number")
             }
+            ParseErrorKind::WrongResistanceCount {
+                source,
+                expected,
+                found,
+            } => write!(
+                f,
+                "{source} gives {found} reference resistances for a \
+                 {expected}-port network"
+            ),
             ParseErrorKind::UnsupportedParameter(p) => write!(
                 f,
                 "unsupported parameter {}: only s-parameters are supported in this version",

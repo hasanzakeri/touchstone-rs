@@ -89,10 +89,27 @@ impl Parameter {
 }
 
 /// Touchstone specification version the file was parsed as.
+///
+/// Four values for two grammars. The 1.x pair share one syntax and differ only
+/// in the option line: a 1.0 file gives at most one reference resistance for
+/// every port, a 1.1 file gives one per port. The 2.x pair share one syntax
+/// too — the 2.1 document states that apart from the `[Version]` argument
+/// string, 2.1 files are identical to 2.0 files — and are kept apart so a
+/// writer can reproduce the argument the source wrote.
+///
+/// "Version 1.1" is the specification's own designation for the per-port
+/// option line; no file announces it, since 1.x files carry no `[Version]`
+/// keyword at all. It is inferred from the option line having more than one
+/// `R` value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Version {
-    V1,
-    V2,
+    /// One reference resistance for all ports.
+    V1_0,
+    /// Per-port reference resistances on the option line.
+    V1_1,
+    V2_0,
+    V2_1,
 }
 
 /// Source-file details preserved for faithful round-tripping.
@@ -102,8 +119,14 @@ pub struct Metadata {
     pub freq_unit: FreqUnit,
     pub parameter: Parameter,
     pub format: Format,
-    /// The `R` value from the option line.
-    pub resistance: f64,
+    /// The `R` values from the option line, in the order written.
+    ///
+    /// One value in a 1.0 or 2.x file, one *per port* in a 1.1 file. This is
+    /// what the option line said, not the reference environment that resulted:
+    /// [`Network::z0`] is where the latter lives, already expanded to every
+    /// port and every frequency, and in a v2 file `[Reference]` may have
+    /// overridden this entirely.
+    pub resistances: Vec<f64>,
     /// The option line as it appeared in the file, if any — trimmed, with
     /// any trailing `!` comment stripped, but otherwise verbatim (original
     /// spacing and case intact) so a write can reproduce the source style.
@@ -119,11 +142,11 @@ impl Default for Metadata {
     /// Option-line defaults per the v1 specification: `# GHZ S MA R 50`.
     fn default() -> Self {
         Metadata {
-            version: Version::V1,
+            version: Version::V1_0,
             freq_unit: FreqUnit::GHz,
             parameter: Parameter::S,
             format: Format::Ma,
-            resistance: 50.0,
+            resistances: vec![50.0],
             option_line: None,
             comments: Vec::new(),
         }
@@ -197,7 +220,7 @@ mod tests {
         assert_eq!(m.freq_unit, FreqUnit::GHz);
         assert_eq!(m.parameter, Parameter::S);
         assert_eq!(m.format, Format::Ma);
-        assert_eq!(m.resistance, 50.0);
+        assert_eq!(m.resistances, [50.0]);
     }
 
     #[test]

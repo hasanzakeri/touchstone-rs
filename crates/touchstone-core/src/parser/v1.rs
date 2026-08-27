@@ -21,8 +21,8 @@
 use num_complex::Complex64;
 
 use super::{
-    NOISE_VALUES_PER_SET, check_option_scope, err, noise_point_from_values, to_complex,
-    values_per_set,
+    NOISE_VALUES_PER_SET, check_option_scope, err, noise_point_from_values, reference_per_port,
+    to_complex, values_per_set,
 };
 use crate::ParseOptions;
 use crate::error::{Error, ParseErrorKind};
@@ -125,18 +125,32 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
     }
     let n = sets.nports.expect("set alongside the first data set");
 
+    // The option line is where the mismatch is, not the data — the count only
+    // became checkable once the port count was known, several hundred lines
+    // later.
+    let option_line_at = option_line_number.expect("set alongside `options`");
+    let z0 = reference_per_port(&opts_ref.resistances, n, "the option line", option_line_at)?;
+
     Ok(Network {
         freq_hz: sets.freq_hz,
         s: sets.s,
         nports: n,
-        z0: vec![opts_ref.resistance; n],
+        z0,
         noise: sets.noise,
         metadata: Metadata {
-            version: Version::V1,
+            // A per-port `R` list is what the 2.1 document calls a Version 1.1
+            // file. Nothing in the file says so — 1.x files carry no
+            // `[Version]` keyword — so the option line's shape is the only
+            // evidence there is.
+            version: if opts_ref.resistances.len() > 1 {
+                Version::V1_1
+            } else {
+                Version::V1_0
+            },
             freq_unit: opts_ref.freq_unit,
             parameter: opts_ref.parameter,
             format: opts_ref.format,
-            resistance: opts_ref.resistance,
+            resistances: opts_ref.resistances,
             option_line,
             comments,
         },
