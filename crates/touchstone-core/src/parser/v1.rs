@@ -21,8 +21,8 @@
 use num_complex::Complex64;
 
 use super::{
-    NOISE_VALUES_PER_SET, check_option_scope, err, noise_point_from_values, reference_per_port,
-    to_complex, values_per_set,
+    NOISE_VALUES_PER_SET, broadcast_reference, check_option_scope, err, noise_point_from_values,
+    reference_per_port, to_complex, values_per_set,
 };
 use crate::ParseOptions;
 use crate::error::{Error, ParseErrorKind};
@@ -129,7 +129,8 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
     // became checkable once the port count was known, several hundred lines
     // later.
     let option_line_at = option_line_number.expect("set alongside `options`");
-    let z0 = reference_per_port(&opts_ref.resistances, n, "the option line", option_line_at)?;
+    let per_port = reference_per_port(&opts_ref.resistances, n, "the option line", option_line_at)?;
+    let z0 = broadcast_reference(&per_port, sets.freq_hz.len());
 
     Ok(Network {
         freq_hz: sets.freq_hz,

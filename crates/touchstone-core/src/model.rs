@@ -176,8 +176,22 @@ pub struct Network {
     /// `(frequency, row, column)`.
     pub s: Vec<Complex64>,
     pub nports: usize,
-    /// Per-port reference impedance, length N.
-    pub z0: Vec<f64>,
+    /// Reference impedance, length F·N, laid out row-major as
+    /// `(frequency, port)` — the same convention as [`Network::s`].
+    ///
+    /// Per frequency *and* complex, though no Touchstone file states either:
+    /// the specification's reference impedance is one real number per port,
+    /// constant across the sweep, and spec 2.0 and 2.1 both say outright that
+    /// complex and imaginary values are not supported. Parsing a conforming
+    /// file therefore fills every row identically and every imaginary part
+    /// with zero.
+    ///
+    /// The shape exists because a reference impedance that is neither of those
+    /// things is nonetheless what field solvers compute and write beside their
+    /// S-parameters, per frequency and complex, when they are asked not to
+    /// renormalize. Reading that is a later milestone; the array it lands in
+    /// is this one, chosen now so it need not change shape then. See ADR 0009.
+    pub z0: Vec<Complex64>,
     pub noise: Option<NoiseData>,
     pub metadata: Metadata,
 }
@@ -193,6 +207,11 @@ impl Network {
         let n = self.nports;
         self.s[fi * n * n + row * n + col]
     }
+
+    /// Reference impedance at frequency index `fi` and `port`, zero-based.
+    pub fn z0_at(&self, fi: usize, port: usize) -> Complex64 {
+        self.z0[fi * self.nports + port]
+    }
 }
 
 #[cfg(test)]
@@ -205,13 +224,18 @@ mod tests {
             freq_hz: vec![1e9, 2e9],
             s: (0..8).map(|i| Complex64::new(i as f64, 0.0)).collect(),
             nports: 2,
-            z0: vec![50.0, 50.0],
+            // Distinct per port and per frequency, so an index that collapsed
+            // either axis would land on the wrong number rather than the right
+            // one by luck.
+            z0: (0..4).map(|i| Complex64::new(f64::from(i), 0.0)).collect(),
             noise: None,
             metadata: Metadata::default(),
         };
         assert_eq!(net.nfreqs(), 2);
         // Second frequency, S21 (row 1, col 0) -> flat index 4 + 2.
         assert_eq!(net.at(1, 1, 0), Complex64::new(6.0, 0.0));
+        // Second frequency, port 1 -> flat index 2 + 1.
+        assert_eq!(net.z0_at(1, 1), Complex64::new(3.0, 0.0));
     }
 
     #[test]

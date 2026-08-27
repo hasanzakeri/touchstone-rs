@@ -99,6 +99,21 @@ pub(crate) fn reference_per_port(
     }
 }
 
+/// Repeat one per-port reference across every frequency, as
+/// [`crate::model::Network::z0`] is laid out.
+///
+/// A declared reference impedance is one number per port for the whole sweep,
+/// in every version of the format. Storing it per frequency costs F·N values
+/// to carry N, which is the price of the array being able to hold a solver's
+/// per-frequency port impedance later without changing shape.
+pub(crate) fn broadcast_reference(per_port: &[f64], nfreqs: usize) -> Vec<Complex64> {
+    let mut z0 = Vec::with_capacity(nfreqs * per_port.len());
+    for _ in 0..nfreqs {
+        z0.extend(per_port.iter().map(|&r| Complex64::new(r, 0.0)));
+    }
+    z0
+}
+
 /// Build a complex value from an on-disk pair, per spec v1.1 §3 p5 and spec
 /// 2.0 p6 — which describe the three formats in identical terms.
 pub(crate) fn to_complex(a: f64, b: f64, format: Format) -> Complex64 {

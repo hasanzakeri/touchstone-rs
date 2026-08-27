@@ -37,8 +37,9 @@ def test_read_returns_arrays_in_the_documented_shapes(tmp_path: Path) -> None:
     assert net.f.shape == (1,)
     assert net.s.dtype == np.complex128
     assert net.s.shape == (1, 2, 2)
-    assert net.z0.dtype == np.float64
-    np.testing.assert_array_equal(net.z0, [50.0, 50.0])
+    assert net.z0.dtype == np.complex128
+    assert net.z0.shape == (1, 2)
+    np.testing.assert_array_equal(net.z0, [[50 + 0j, 50 + 0j]])
     assert repr(net) == "<Network 2-port, 1 frequency points>"
 
 
@@ -71,7 +72,7 @@ def test_multiple_points_keep_their_order(tmp_path: Path) -> None:
     assert net.s.shape == (5, 2, 2)
     np.testing.assert_array_equal(net.f, [1e9, 2e9, 3e9, 4e9, 5e9])
     assert net.s[4, 0, 0] == 5.1 + 0j
-    np.testing.assert_array_equal(net.z0, [75.0, 75.0])
+    np.testing.assert_array_equal(net.z0, np.full((net.f.size, 2), 75 + 0j))
 
 
 def test_uppercase_extension_is_recognized(tmp_path: Path) -> None:
@@ -116,7 +117,7 @@ def test_a_real_multiport_export_crosses_into_numpy_with_the_right_shape() -> No
 
     assert net.nports == 16
     assert net.s.shape == (10, 16, 16)
-    assert net.z0.shape == (16,)
+    assert net.z0.shape == (net.f.size, 16)
     assert net.s.dtype == np.complex128
     assert repr(net) == "<Network 16-port, 10 frequency points>"
 

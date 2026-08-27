@@ -27,6 +27,37 @@ fn ok(input: &str) -> Network {
     parse_str(input).expect("should parse")
 }
 
+/// The per-port reference impedance of a network whose `z0` is constant
+/// across the sweep and real — which every conforming Touchstone file's is,
+/// since the format declares one real value per port for the whole sweep.
+///
+/// `Network::z0` is `(F, N)` and complex so that it can one day hold a
+/// solver's own per-frequency port impedance (ADR 0009). Nothing a v1 file can
+/// say produces either, so asserting the flatness here is not ceremony: it is
+/// the check that the broadcast filled every row, and it lets the assertions
+/// below stay about the number that was declared.
+fn constant_z0(net: &Network) -> Vec<f64> {
+    let n = net.nports;
+    assert_eq!(net.z0.len(), net.nfreqs() * n, "z0 must be (F, N)");
+    let per_port: Vec<f64> = (0..n)
+        .map(|port| {
+            let z = net.z0_at(0, port);
+            assert_eq!(z.im, 0.0, "port {port}: a declared reference is real");
+            z.re
+        })
+        .collect();
+    for fi in 1..net.nfreqs() {
+        for (port, &expected) in per_port.iter().enumerate() {
+            assert_eq!(
+                net.z0_at(fi, port),
+                Complex64::new(expected, 0.0),
+                "z0 changed at frequency {fi}, port {port}"
+            );
+        }
+    }
+    per_port
+}
+
 /// The `(line, kind)` of the parse error `input` produces.
 fn fails(input: &str) -> (usize, ParseErrorKind) {
     match parse_str(input) {
@@ -87,7 +118,7 @@ fn reads_a_minimal_two_port_file() {
     assert_eq!(net.nports, 2);
     assert_eq!(net.nfreqs(), 1);
     assert_eq!(net.freq_hz, [1e9]);
-    assert_eq!(net.z0, [50.0, 50.0]);
+    assert_eq!(constant_z0(&net), [50.0, 50.0]);
     assert!(net.noise.is_none());
     assert_eq!(net.s.len(), 4);
 
@@ -114,7 +145,7 @@ mod version_1_1 {
     #[test]
     fn per_port_resistances_reach_z0_in_order() {
         let net = ok(PER_PORT_R);
-        assert_eq!(net.z0, [50.0, 75.0]);
+        assert_eq!(constant_z0(&net), [50.0, 75.0]);
         assert_eq!(net.metadata.version, Version::V1_1);
         assert_eq!(net.metadata.resistances, [50.0, 75.0]);
     }
@@ -124,7 +155,7 @@ mod version_1_1 {
     #[test]
     fn one_value_is_still_broadcast_to_every_port() {
         let net = ok("# GHZ S RI R 75\n1.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\n");
-        assert_eq!(net.z0, [75.0, 75.0]);
+        assert_eq!(constant_z0(&net), [75.0, 75.0]);
         assert_eq!(net.metadata.version, Version::V1_0);
     }
 
@@ -186,7 +217,7 @@ fn a_bare_hash_defaults_to_ghz_and_fifty_ohms() {
     // else comes from the defaults in spec v1.1 §3.
     let net = ok("# RI\n2.5 0 0 0 0 0 0 0 0\n");
     assert_eq!(net.freq_hz, [2.5e9]);
-    assert_eq!(net.z0, [50.0, 50.0]);
+    assert_eq!(constant_z0(&net), [50.0, 50.0]);
     assert_eq!(net.metadata.freq_unit, FreqUnit::GHz);
     assert_eq!(net.metadata.parameter, Parameter::S);
 }
@@ -195,7 +226,7 @@ fn a_bare_hash_defaults_to_ghz_and_fifty_ohms() {
 fn the_option_line_may_be_lower_case_and_reordered() {
     let net = ok("# ri r 75 mhz s\n1.0 0 0 0 0 0 0 0 0\n");
     assert_eq!(net.freq_hz, [1e6]);
-    assert_eq!(net.z0, [75.0, 75.0]);
+    assert_eq!(constant_z0(&net), [75.0, 75.0]);
 }
 
 #[test]
@@ -238,7 +269,7 @@ fn the_option_line_is_kept_verbatim_minus_any_trailing_comment() {
         net.metadata.option_line.as_deref(),
         Some("#  hZ   S   RI   R     50.00")
     );
-    assert_eq!(net.z0, [50.0, 50.0]);
+    assert_eq!(constant_z0(&net), [50.0, 50.0]);
 }
 
 #[test]
@@ -276,7 +307,7 @@ fn a_second_option_line_is_ignored_and_the_first_still_governs() {
         "2.0 0 0 0 0 0 0 0 0\n",
     ));
     assert_eq!(net.freq_hz, [1e9, 2e9]);
-    assert_eq!(net.z0, [50.0, 50.0]);
+    assert_eq!(constant_z0(&net), [50.0, 50.0]);
 }
 
 #[test]
@@ -363,7 +394,7 @@ fn a_one_port_file_reads_its_single_entry() {
     let net = ok("# GHZ S RI R 50\n1.0 0.5 -0.25\n2.0 0.4 -0.3\n");
     assert_eq!(net.nports, 1);
     assert_eq!(net.nfreqs(), 2);
-    assert_eq!(net.z0, [50.0]);
+    assert_eq!(constant_z0(&net), [50.0]);
     assert_eq!(net.at(0, 0, 0), Complex64::new(0.5, -0.25));
     assert_eq!(net.at(1, 0, 0), Complex64::new(0.4, -0.3));
 }
@@ -1360,7 +1391,7 @@ fn a_real_ads_export_parses_and_matches_its_known_values() {
     assert_eq!(net.nfreqs(), 10);
     assert_eq!(net.freq_hz[0], 1e9);
     assert_eq!(net.freq_hz[9], 10e9);
-    assert_eq!(net.z0, [50.0, 50.0]);
+    assert_eq!(constant_z0(&net), [50.0, 50.0]);
 
     // The network is purely resistive, so every frequency carries the same
     // values; spot-check the first and last points.
@@ -1622,7 +1653,7 @@ mod one_port {
         assert_eq!(net.nports, 1);
         assert_eq!(net.nfreqs(), 30);
         assert_eq!(net.s.len(), 30);
-        assert_eq!(net.z0, [50.0]);
+        assert_eq!(constant_z0(&net), [50.0]);
         assert_eq!(net.freq_hz[0], 50e6, "0.05 GHz");
         assert_eq!(net.freq_hz[29], 1.5e9);
         assert_eq!(net.at(0, 0, 0), Complex64::new(0.973077725, -0.144262395));
@@ -1804,7 +1835,7 @@ mod multiport {
         assert_eq!(net.nports, 16);
         assert_eq!(net.nfreqs(), 10);
         assert_eq!(net.s.len(), 10 * 256);
-        assert_eq!(net.z0.len(), 16);
+        assert_eq!(constant_z0(&net), [50.0; 16]);
         assert_not_reciprocal(&net);
 
         // S(1,16) closes row 1, on the *fourth* line of the data set; a

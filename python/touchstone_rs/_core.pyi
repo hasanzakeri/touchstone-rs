@@ -1,7 +1,14 @@
+from collections.abc import Sequence
 from os import PathLike
+from typing import Any, TypeAlias
 
 import numpy as np
 import numpy.typing as npt
+
+# Anything the z0 parameter accepts: a numeric array of any dtype, or a plain
+# sequence of numbers. Real input is widened -- the format's own reference
+# impedances are real, so a caller holding real values is the ordinary case.
+Z0Like: TypeAlias = npt.NDArray[np.number[Any]] | Sequence[complex]
 
 __version__: str
 
@@ -23,14 +30,15 @@ class Network:
         self,
         f: npt.NDArray[np.float64],
         s: npt.NDArray[np.complex128],
-        z0: npt.NDArray[np.float64] | None = None,
+        # Shaped (N,) -- one per port, tiled over the sweep -- or (F, N).
+        z0: Z0Like | None = None,
     ) -> None: ...
     @property
     def f(self) -> npt.NDArray[np.float64]: ...
     @property
     def s(self) -> npt.NDArray[np.complex128]: ...
     @property
-    def z0(self) -> npt.NDArray[np.float64]: ...
+    def z0(self) -> npt.NDArray[np.complex128]: ...
     @property
     def nports(self) -> int: ...
     @property

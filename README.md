@@ -27,7 +27,7 @@ import touchstone_rs as ts
 net = ts.read("coupler.s4p")  # v1.0, any port count, RI/MA/DB, today
 net.f        # np.float64, shape (F,)      — frequencies, always Hz
 net.s        # np.complex128, shape (F, N, N)
-net.z0       # np.float64, shape (N,)      — per-port reference impedance
+net.z0       # np.complex128, shape (F, N) — per-port reference impedance
 net.noise    # NoiseData | None            — noise parameters, if present
 
 amp = ts.read("lna.s2p")
