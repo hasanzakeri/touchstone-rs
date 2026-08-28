@@ -230,8 +230,25 @@ pub struct NoiseData {
     pub nfmin_db: Vec<f64>,
     /// Optimal source reflection coefficient.
     pub gamma_opt: Vec<Complex64>,
-    /// Effective noise resistance, normalized to the reference impedance.
+    /// Effective noise resistance **exactly as the file writes it**, which is
+    /// not the same quantity in every version.
+    ///
+    /// A 1.0 or 1.1 file writes it normalized to the option line's reference
+    /// resistance; a 2.0 or 2.1 file writes it in ohms. The specification
+    /// demonstrates the difference with its own paired examples, where one
+    /// device's noise row changes in this column alone, from `0.38` to `19`
+    /// against a 50 Ω reference.
+    ///
+    /// Use [`NoiseData::rn_ohms`] for a number that means the same thing
+    /// whatever wrote the file. This field exists because it is what the file
+    /// says, and a writer needs it to reproduce its input. See ADR 0010.
     pub rn: Vec<f64>,
+    /// Effective noise resistance in ohms, whatever the source version.
+    ///
+    /// Derived: `rn` multiplied by the option line's reference resistance for
+    /// a 1.x file — port 1's, where they differ — and `rn` unchanged for a 2.x
+    /// one, which already writes ohms.
+    pub rn_ohms: Vec<f64>,
 }
 
 /// A parsed Touchstone file: an N-port network sampled at F frequencies.

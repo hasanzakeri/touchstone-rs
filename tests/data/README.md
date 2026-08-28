@@ -108,6 +108,72 @@ time so a failing test names its own cause.
 | `ads_1port_db_ghz.s1p` | The DB member of the cross-format check. |
 | `ads_1port_db_ghz_low_precision.s1p` | The same export rounded to four significant figures instead of nine. Rounding in the source is not an error to reject; the test asserts it parses and lands within its own rounding of the full-precision file. |
 
+## The Touchstone 2.0 family (added at M4)
+
+HFSS exports, 2026-08-26, by the project author. The 2.0 writer and the
+older `.sNp` writer produce different things, and both are here: every `.ts`
+file carries `[Version] 2.0`, a `[Matrix Format]` and a `[Reference]` block,
+while the `.sNp` files carry no version keyword at all and instead write a
+`! Port Impedance` comment after each frequency record.
+
+**What these can and cannot catch.** All of them describe passive structures,
+so every one is reciprocal — which is useless for detecting a transposed read
+and exactly right for `[Matrix Format]` Lower and Upper, whose whole premise
+is that the matrix is symmetric. The transpose guard comes from the derived
+files below instead.
+
+| File | Notes |
+|---|---|
+| `hfss_v2_symmetric_4port_ri.ts`, `_ma.ts`, `_db.ts` | Two coupled microstrip lines of unequal width and length, 51 points over 0.1–20 GHz. Reciprocal to 1.2e-13, with every distinct entry separated by at least 0.117 and none flat, which is what makes it a sound base for the Lower and Upper forms. Its `[Reference]` block is the layout worth having: the keyword alone on its line, then one value per line, indented, each with a trailing `! Port[n]` comment. Once comments are stripped those lines are indistinguishable from data, so a reader that noted the keyword and resumed its normal loop would swallow them as a frequency point. |
+| `hfss_v2_waveguide_2port_ri.ts` | WR-90 waveguide across its 6.56 GHz cutoff, 121 points over 6–12 GHz. A real 2-port v2 file carrying `[Two-Port Data Order] 12_21`. |
+| `hfss_microstrip_2port_ri_unnormalized.s2p` | Touchstone 1.0, 201 points. **The only file here with comments *between* frequency records** — a `! Gamma` and a `! Port Impedance` line after every one — and the only one whose option line is `# GHz S RI` with no `R` at all, so the reference falls back to the documented 50 Ω default. Its port impedance is complex and different at every frequency; reading that is a later milestone, and this is the file it will be designed against. |
+| `hfss_microstrip_2port_ri_50ohm.s2p` | The renormalized twin of the file above. Its `! Port Impedance` lines degenerate to `50 0 50 0`, which is a trap for any reader that treats the comment's presence as meaning the data is un-renormalized. Carries the `R 50.000000` option-line form. |
+| `hfss_symmetric_4port_ma_unnormalized.s4p` | The same per-frequency impedance case at four ports, 51 points over 0.1–10 GHz. |
+
+These are committed **verbatim**, with one exception. Each embedded an
+absolute path containing the author's home directory, so that value — and the
+project and design names beside it — were replaced. Two or three comment lines
+per file differ from the export; every byte that carries exporter behaviour
+does not. That was verified mechanically: identical line count, identical CRLF
+endings, and an empty diff over all non-comment lines. The `HFSS 2025.2.0` and
+`Ansys Full-Wave Spice` provenance lines are kept, as is
+`!Data is not renormalized` with its missing space after the `!`.
+
+| File | sha256 (first 16) |
+|---|---|
+| `hfss_v2_symmetric_4port_ri.ts` | `5f68d631fe815e95` |
+| `hfss_v2_symmetric_4port_ma.ts` | `09d93b55a531a58c` |
+| `hfss_v2_symmetric_4port_db.ts` | `c1d13b737a390a58` |
+| `hfss_v2_waveguide_2port_ri.ts` | `ded134e1566af6f3` |
+| `hfss_microstrip_2port_ri_unnormalized.s2p` | `724c5ed88ae6b445` |
+| `hfss_microstrip_2port_ri_50ohm.s2p` | `d0e319f286ce3915` |
+| `hfss_symmetric_4port_ma_unnormalized.s4p` | `edfce668e15efbc0` |
+
+## The derived 2.0 pair (added at M4)
+
+| File | Notes |
+|---|---|
+| `ads_v2_varying_noise_2port_ri_21_12.ts`, `_12_21.ts` | **Derived** from `ads_varying_noise_2port_ri.s2p`: the same amplifier rewritten in 2.0 syntax twice, once in each data order. |
+
+These exist because nothing available could export them. `[Two-Port Data
+Order]` can only be tested by a **non-reciprocal** device — a mirrored read is
+invisible in reciprocal data — and every 2.0 export obtainable here describes a
+passive, reciprocal structure. So the two orders are built from a real
+export's own numbers: the S-data tokens are reproduced exactly, with only the
+two middle pairs exchanged between the files, and the noise section is carried
+over with its effective noise resistance converted to ohms, which is what a
+2.0 file must write where a 1.0 file writes it normalized.
+
+Two properties make the pair worth having. The device is unilateral and
+frequency-dependent, so a transposed read or a misframed point cannot pass
+unnoticed; and because every other token is untouched, the v1 original and the
+`21_12` rewrite must parse **bit-identically**, which ties the v2 ordering to
+the v1 one rather than letting the two drift into being wrong together.
+
+The converted `Rn` values are written to full round-trip precision — `59.134161500000005` rather than `59.1341615` — so that the product computed
+from the v1 file and the value parsed from the v2 file are the same `f64`, and
+the cross-version assertion can be exact rather than approximate.
+
 ## Manufacturer files
 
 Manufacturer-published S-parameter files are useful for real-world coverage

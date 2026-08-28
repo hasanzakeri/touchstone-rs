@@ -869,6 +869,233 @@ mod version_dispatch {
     }
 }
 
+/// The `[Noise Data]` section.
+///
+/// The five columns mean the same thing as in v1 — Γopt is a magnitude and an
+/// angle whatever the option line says — with one exception that the
+/// specification demonstrates itself: the effective noise resistance is
+/// normalized in a 1.x file and in ohms in a 2.x one.
+mod noise {
+    use super::*;
+
+    /// Spec 2.0 Example 18: the v1 form of a 2-port with noise.
+    const EXAMPLE_18_V1: &str = "\
+!2-port network, S-parameter and noise data
+!Default MA format, GHz frequencies, 50 ohm reference, S-parameters
+#
+! NETWORK PARAMETERS
+2   .95 -26   3.57 157 .04 76 .66 -14
+22 .60 -144 1.30 40   .14 40 .56 -85
+! NOISE PARAMETERS
+4    .7 .64  69 .38
+18 2.7 .46 -33 .40
+";
+
+    /// Spec 2.0 Example 20: the same device in 2.0 syntax.
+    ///
+    /// Transcribed with **`[Two-Port Data Order] 21_12` added**, which the
+    /// document's own example omits. Page 8 makes the keyword required when
+    /// the port count is 2, so Examples 19 and 20 as printed contradict it —
+    /// Examples 3, 12 and 17 all include it. `21_12` is the order the data is
+    /// in, being the same rows as Example 18. No value is altered.
+    const EXAMPLE_20_V2: &str = "\
+!2-port network, S-parameter and noise data
+!Default MA format, GHz frequencies, 50 ohm reference, S-parameters
+[Version] 2.0
+#
+[Number of Ports] 2
+[Two-Port Data Order] 21_12
+[Number of Frequencies] 2
+[Number of Noise Frequencies] 2
+[Reference] 50 25.0
+[Network Data]
+! NETWORK PARAMETERS
+2   .95 -26   3.57 157 .04 76 .66 -14
+22 .60 -144 1.30 40   .14 40 .56 -85
+[Noise Data]
+! NOISE PARAMETERS
+4    .7 .64  69 19
+18 2.7 .46 -33 20
+[End]
+";
+
+    #[test]
+    fn the_section_is_read_whole() {
+        let net = ok(EXAMPLE_20_V2);
+        let noise = net.noise.as_ref().expect("the file has a noise section");
+        assert_eq!(noise.freq_hz, [4e9, 18e9]);
+        assert_eq!(noise.nfmin_db, [0.7, 2.7]);
+        assert_eq!(noise.rn, [19.0, 20.0]);
+        // Γopt is a magnitude and an angle in degrees regardless of format —
+        // reading `.64 69` as real/imaginary would give 0.64 + 69i.
+        assert!(noise.gamma_opt[0].l1_norm() < 1.0);
+        assert!((noise.gamma_opt[0].norm() - 0.64).abs() < 1e-12);
+    }
+
+    /// **The version divergence**, in the specification's own paired examples.
+    ///
+    /// One device, written twice. Four of the five noise columns are identical
+    /// between them; the fifth reads `.38` in the 1.0 file and `19` in the 2.0
+    /// one, because 1.x normalizes the effective noise resistance to the
+    /// option line's reference and 2.x writes ohms. `rn` therefore differs by
+    /// construction, and `rn_ohms` must not.
+    #[test]
+    fn rn_differs_between_versions_and_rn_ohms_does_not() {
+        let (v1, v2) = (ok(EXAMPLE_18_V1), ok(EXAMPLE_20_V2));
+        let (a, b) = (v1.noise.unwrap(), v2.noise.unwrap());
+
+        assert_eq!(a.rn, [0.38, 0.40], "1.0 normalizes to the option line's R");
+        assert_eq!(b.rn, [19.0, 20.0], "2.0 writes ohms");
+        assert_ne!(a.rn, b.rn, "the field the document shows differing");
+
+        assert_eq!(a.rn_ohms, [19.0, 20.0]);
+        assert_eq!(b.rn_ohms, [19.0, 20.0]);
+
+        // And everything else about the section is untouched by the change.
+        assert_eq!(a.freq_hz, b.freq_hz);
+        assert_eq!(a.nfmin_db, b.nfmin_db);
+        assert_eq!(a.gamma_opt, b.gamma_opt);
+    }
+
+    /// `[Reference]` has no effect on noise data (spec 2.0 p24) — Γopt and the
+    /// normalization stay against the option line's `R`. Example 20 is the
+    /// case that can tell: its ports are referenced to 50 and 25 Ω, so a
+    /// reader that used `z0` would produce a different answer for port 2.
+    #[test]
+    fn the_reference_keyword_does_not_reach_the_noise_section() {
+        let net = ok(EXAMPLE_20_V2);
+        assert_eq!(constant_z0(&net), [50.0, 25.0]);
+        assert_eq!(net.noise.unwrap().rn_ohms, [19.0, 20.0]);
+    }
+
+    #[test]
+    fn a_file_without_a_noise_section_has_no_noise() {
+        assert!(ok(MINIMAL).noise.is_none());
+    }
+
+    /// Both directions of spec 2.0 p24's conditional: the count is required
+    /// when there is a section, and prohibited when there is not.
+    #[test]
+    fn the_noise_count_and_the_noise_section_require_each_other() {
+        let no_count = EXAMPLE_20_V2.replace("[Number of Noise Frequencies] 2\n", "");
+        assert_eq!(
+            kind(&no_count),
+            ParseErrorKind::MissingKeyword("[Number of Noise Frequencies]")
+        );
+
+        let no_section = MINIMAL.replace(
+            "[Number of Frequencies] 1",
+            "[Number of Frequencies] 1\n[Number of Noise Frequencies] 2",
+        );
+        assert!(matches!(
+            kind(&no_section),
+            ParseErrorKind::KeywordNotPermitted { keyword, .. }
+                if keyword == "[Number of Noise Frequencies]"
+        ));
+    }
+
+    #[test]
+    fn a_declared_noise_count_is_checked_against_the_rows() {
+        let input = EXAMPLE_20_V2.replace(
+            "[Number of Noise Frequencies] 2",
+            "[Number of Noise Frequencies] 3",
+        );
+        assert_eq!(
+            kind(&input),
+            ParseErrorKind::DeclaredCountMismatch {
+                keyword: "[Number of Noise Frequencies]",
+                declared: 3,
+                found: 2,
+            }
+        );
+    }
+
+    /// Noise parameters are defined for 2-port networks only.
+    #[test]
+    fn a_noise_section_needs_two_ports() {
+        let input = MINIMAL
+            .replace(
+                "[Number of Frequencies] 1",
+                "[Number of Frequencies] 1\n[Number of Noise Frequencies] 1",
+            )
+            .replace("[End]", "[Noise Data]\n4 0.7 0.64 69 19\n[End]");
+        assert_eq!(
+            kind(&input),
+            ParseErrorKind::NoiseRequiresTwoPorts { nports: 1 }
+        );
+    }
+
+    /// Spec 2.0 p24 groups each noise point onto one line. Requiring that is
+    /// what turns a truncated row into a message naming the row, rather than a
+    /// count mismatch discovered pages later — and unlike v1, the section is
+    /// delimited by a keyword, so there is no wrapping to be tolerant of.
+    #[test]
+    fn a_noise_row_must_hold_exactly_five_values() {
+        let short = EXAMPLE_20_V2.replace("4    .7 .64  69 19", "4 .7 .64 69");
+        assert!(matches!(
+            kind(&short),
+            ParseErrorKind::MalformedNoiseLine { found: 4, .. }
+        ));
+
+        let long = EXAMPLE_20_V2.replace("4    .7 .64  69 19", "4 .7 .64 69 19 20");
+        assert!(matches!(
+            kind(&long),
+            ParseErrorKind::MalformedNoiseLine { found: 6, .. }
+        ));
+    }
+
+    /// The malformed-row message names where the section began, because a
+    /// reader's first question is usually whether it began in the right place.
+    #[test]
+    fn a_malformed_row_names_the_sections_first_line() {
+        let input = EXAMPLE_20_V2.replace("18 2.7 .46 -33 20", "18 2.7 .46 -33");
+        let (line, kind) = fails(&input);
+        let noise_line = EXAMPLE_20_V2
+            .lines()
+            .position(|l| l.starts_with("[Noise Data]"))
+            .expect("the fixture has the keyword")
+            + 1;
+        assert!(line > noise_line);
+        assert!(matches!(
+            kind,
+            ParseErrorKind::MalformedNoiseLine { noise_starts_at, .. }
+                if noise_starts_at == noise_line
+        ));
+    }
+
+    #[test]
+    fn noise_frequencies_must_increase() {
+        let input = EXAMPLE_20_V2.replace("18 2.7 .46 -33 20", "4 2.7 .46 -33 20");
+        assert!(matches!(
+            kind(&input),
+            ParseErrorKind::NoiseFrequencyNotAscending { .. }
+        ));
+    }
+
+    /// The noise grid need not match the S-parameter grid, in either length or
+    /// spacing — Example 20's own noise points are 4 and 18 GHz against
+    /// S-parameters at 2 and 22.
+    #[test]
+    fn the_noise_grid_is_independent_of_the_s_parameter_grid() {
+        let net = ok(EXAMPLE_20_V2);
+        assert_eq!(net.freq_hz, [2e9, 22e9]);
+        assert_eq!(net.noise.unwrap().freq_hz, [4e9, 18e9]);
+    }
+
+    /// Unlike v1, where the rule is the only way to find the section at all, a
+    /// v2 noise sweep that starts above the network sweep is still read
+    /// exactly right — the keyword has already said where the section is. See
+    /// the module documentation in `parser/v2.rs`.
+    #[test]
+    fn a_noise_sweep_above_the_network_sweep_is_still_read() {
+        let input = EXAMPLE_20_V2
+            .replace("4    .7 .64  69 19", "30 .7 .64 69 19")
+            .replace("18 2.7 .46 -33 20", "40 2.7 .46 -33 20");
+        let net = ok(&input);
+        assert_eq!(net.noise.unwrap().freq_hz, [30e9, 40e9]);
+    }
+}
+
 /// Real exports. These prove the parser agrees with what a tool writes, rather
 /// than only with the inline fixtures written alongside it.
 mod real_files {
@@ -933,6 +1160,73 @@ mod real_files {
             .join("../../tests/data/hfss_v2_symmetric_4port_ri.ts");
         let net = parse_file(&path).expect("should parse from disk");
         assert_eq!(net.nports, 4);
+    }
+
+    /// The two data orders on **real** data, and the version divergence on it
+    /// too.
+    ///
+    /// No tool available for this milestone writes a non-reciprocal 2-port in
+    /// Touchstone 2.0, so these are derived from a committed export: the same
+    /// amplifier, rewritten in 2.0 syntax twice, once in each data order, with
+    /// the noise section's `Rn` converted to ohms as a 2.0 file must write it.
+    /// Every other token is reproduced exactly. That the numbers came from a
+    /// real export is what makes the agreement below worth asserting — the
+    /// device is unilateral and frequency-dependent, so a transposed read or a
+    /// misframed point cannot pass unnoticed.
+    mod derived_from_a_real_export {
+        use super::*;
+
+        const V2_21_12: &str =
+            include_str!("../../../tests/data/ads_v2_varying_noise_2port_ri_21_12.ts");
+        const V2_12_21: &str =
+            include_str!("../../../tests/data/ads_v2_varying_noise_2port_ri_12_21.ts");
+        const AS_V1: &str = include_str!("../../../tests/data/ads_varying_noise_2port_ri.s2p");
+
+        #[test]
+        fn the_two_orders_agree_on_real_data() {
+            assert_same_matrix(&ok(V2_21_12), &ok(V2_12_21), 0.0, "21_12 vs 12_21");
+        }
+
+        /// Touchstone 1.0's silent convention is `21_12`, so the v1 export and
+        /// the `21_12` rewrite of it must be the same network — bit for bit,
+        /// since the tokens are identical and only their arrangement differs.
+        #[test]
+        fn the_v1_export_matches_its_twenty_one_twelve_rewrite() {
+            assert_same_matrix(&ok(AS_V1), &ok(V2_21_12), 0.0, "v1 vs 21_12");
+        }
+
+        /// The `rn` / `rn_ohms` split on real measured values rather than the
+        /// specification's two-row illustration. `rn` differs by the reference
+        /// resistance and `rn_ohms` does not differ at all.
+        #[test]
+        fn rn_ohms_survives_the_version_change_exactly() {
+            let v1 = ok(AS_V1).noise.expect("the export has a noise section");
+            let v2 = ok(V2_21_12).noise.expect("the rewrite keeps it");
+
+            assert_eq!(v1.freq_hz, v2.freq_hz);
+            assert_eq!(v1.nfmin_db, v2.nfmin_db);
+            assert_eq!(v1.gamma_opt, v2.gamma_opt);
+            assert_ne!(v1.rn, v2.rn, "1.x normalizes, 2.x writes ohms");
+            assert_eq!(
+                v1.rn_ohms, v2.rn_ohms,
+                "the derived value is the same quantity either way"
+            );
+            // Every point varies, so this is not agreement between two
+            // constants.
+            assert!(v1.rn_ohms.windows(2).any(|w| w[0] != w[1]));
+        }
+
+        #[test]
+        fn the_noise_section_is_recorded_in_full() {
+            let net = ok(V2_21_12);
+            let noise = net.noise.as_ref().expect("has noise");
+            assert_eq!(noise.freq_hz.len(), 10);
+            assert_eq!(net.nfreqs(), 10);
+            assert_eq!(net.metadata.two_port_order, Some(TwoPortOrder::S21First));
+            // Angles well off every axis, so a real/imaginary swap in Γopt
+            // could not survive: the source's run from 77.9° to 151.3°.
+            assert!(noise.gamma_opt.iter().all(|g| g.im.abs() > 1e-3));
+        }
     }
 
     /// Real v1 exports whose comments sit *between* frequency records rather

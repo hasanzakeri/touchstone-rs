@@ -18,7 +18,8 @@ use num_complex::Complex64;
 
 use super::keyword::{Keyword, KeywordLine, looks_like_keyword, parse_keyword_line};
 use super::{
-    broadcast_reference, check_option_scope, err, reference_per_port, to_complex, values_per_point,
+    NOISE_VALUES_PER_SET, broadcast_reference, check_option_scope, err, noise_point_from_values,
+    reference_per_port, to_complex, values_per_point,
 };
 use crate::ParseOptions;
 use crate::error::{Error, ParseErrorKind};
@@ -45,52 +46,65 @@ pub(crate) fn parse_v2(
     // The header runs until `[Network Data]`. Everything the data reader needs
     // is settled by then, which is the whole point of the keyword block.
     let data_starts_at = header.read(&mut lines)?;
+    let (declared_noise, noise_count_at) = (header.nnoise, header.nnoise_at);
     let plan = header.finish(data_starts_at)?;
+
     let mut data = NetworkData::new(&plan);
-    let mut ended = false;
+    let mut noise = NoisePoints::default();
+    let mut section = Section::Network;
 
     for line in lines {
         if line.content.is_empty() {
             continue;
         }
-        if !ended && looks_like_keyword(line.content) {
+        if looks_like_keyword(line.content) {
             let keyword = parse_keyword_line(line.content, line.number)?;
-            match keyword.keyword {
-                Keyword::End => {
-                    ended = true;
-                    continue;
+            match (keyword.keyword, section) {
+                (Keyword::NoiseData, Section::Network) => {
+                    data.check_complete(&plan)?;
+                    if plan.nports != 2 {
+                        return Err(err(
+                            line.number,
+                            ParseErrorKind::NoiseRequiresTwoPorts {
+                                nports: plan.nports,
+                            },
+                        ));
+                    }
+                    if declared_noise.is_none() {
+                        return Err(err(
+                            line.number,
+                            ParseErrorKind::MissingKeyword(
+                                Keyword::NumberOfNoiseFrequencies.as_str(),
+                            ),
+                        ));
+                    }
+                    noise.starts_at = line.number;
+                    section = Section::Noise;
                 }
-                other => {
+                (Keyword::End, Section::Network | Section::Noise) => section = Section::Ended,
+                (other, _) => {
                     return Err(err(
                         line.number,
                         ParseErrorKind::KeywordOutOfOrder {
                             keyword: other.as_str(),
-                            detail: "network data has already begun",
+                            detail: "the network data has already begun",
                         },
                     ));
                 }
             }
+            continue;
         }
-        if ended {
+        match section {
+            Section::Network => data.push_line(line.content, line.number, &plan)?,
+            Section::Noise => noise.push_line(line.content, line.number, plan.freq_scale)?,
             // Spec 2.0 p25: `[End]` defines the end of the file, and
-            // non-comment text after it is an error. Comments are not,
-            // and never reach here — they have no content.
-            return Err(err(line.number, ParseErrorKind::TrailingDataAfterEnd));
+            // non-comment text after it is an error. Comments are not, and
+            // never reach here — they have no content.
+            Section::Ended => return Err(err(line.number, ParseErrorKind::TrailingDataAfterEnd)),
         }
-        data.push_line(line.content, line.number, &plan)?;
     }
 
-    // A partly-read point is a truncated file. Reported as the value count it
-    // is, against the line the point began on.
-    if !data.block.is_empty() {
-        return Err(err(
-            data.block_line,
-            ParseErrorKind::WrongValueCount {
-                expected: plan.values_per_point,
-                found: data.block.len(),
-            },
-        ));
-    }
+    data.check_complete(&plan)?;
     if data.freq_hz.len() != plan.nfreqs {
         return Err(err(
             plan.data_starts_at,
@@ -102,15 +116,60 @@ pub(crate) fn parse_v2(
         ));
     }
 
+    // Spec 2.0 p24 makes the two conditional on each other in both
+    // directions: the count is required if noise data is present and
+    // prohibited if it is not. A file that declares a count and then has no
+    // section is as wrong as one that has a section and declares nothing.
+    //
+    // Whether the section was *entered*, not which state the reader ended in —
+    // `[End]` moves past `Noise` and would otherwise answer yes for a file
+    // that never had one.
+    let had_noise_section = noise.starts_at != 0;
+    let noise = match (declared_noise, had_noise_section) {
+        (Some(declared), true) => {
+            let found = noise.data.freq_hz.len();
+            if found != declared {
+                return Err(err(
+                    noise.starts_at,
+                    ParseErrorKind::DeclaredCountMismatch {
+                        keyword: Keyword::NumberOfNoiseFrequencies.as_str(),
+                        declared,
+                        found,
+                    },
+                ));
+            }
+            Some(noise.data)
+        }
+        (Some(_), false) => {
+            return Err(err(
+                noise_count_at,
+                ParseErrorKind::KeywordNotPermitted {
+                    keyword: Keyword::NumberOfNoiseFrequencies.as_str(),
+                    detail: "the file has no [Noise Data] section".to_string(),
+                },
+            ));
+        }
+        (None, _) => None,
+    };
+
     let z0 = broadcast_reference(&plan.reference, data.freq_hz.len());
     Ok(Network {
         freq_hz: data.freq_hz,
         s: data.s,
         nports: plan.nports,
         z0,
-        noise: None,
+        noise,
         metadata: plan.metadata,
     })
+}
+
+/// Which block of the file the reader is in. `[End]` may close either of the
+/// first two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Network,
+    Noise,
+    Ended,
 }
 
 /// Everything the data reader needs, fixed before the first value is read.
@@ -142,6 +201,9 @@ struct Header {
     nports: Option<usize>,
     nfreqs: Option<usize>,
     nnoise: Option<usize>,
+    /// Line `[Number of Noise Frequencies]` was seen on, so a count declared
+    /// for a section the file never has is reported where it was declared.
+    nnoise_at: usize,
     reference: Option<Vec<f64>>,
     matrix_format: Option<MatrixFormat>,
     two_port_order: Option<TwoPortOrder>,
@@ -160,6 +222,7 @@ impl Header {
             nports: None,
             nfreqs: None,
             nnoise: None,
+            nnoise_at: 0,
             reference: None,
             matrix_format: None,
             two_port_order: None,
@@ -307,6 +370,7 @@ impl Header {
             }
             Keyword::NumberOfNoiseFrequencies => {
                 self.nnoise = Some(positive_integer(line.argument, name, at)?);
+                self.nnoise_at = at;
             }
             Keyword::TwoPortDataOrder => {
                 let nports = self.nports.expect("checked above");
@@ -533,6 +597,22 @@ impl NetworkData {
         Ok(())
     }
 
+    /// Fail if a point is half-read — a truncated file, or one that ran into
+    /// `[Noise Data]` mid-point. Reported as the value count it is, against
+    /// the line the point began on.
+    fn check_complete(&self, plan: &Plan) -> Result<(), Error> {
+        if self.block.is_empty() {
+            return Ok(());
+        }
+        Err(err(
+            self.block_line,
+            ParseErrorKind::WrongValueCount {
+                expected: plan.values_per_point,
+                found: self.block.len(),
+            },
+        ))
+    }
+
     fn flush(&mut self, plan: &Plan) -> Result<(), Error> {
         let line = self.block_line;
         let frequency = self.block[0] * plan.freq_scale;
@@ -574,6 +654,84 @@ impl NetworkData {
 
         self.freq_hz.push(frequency);
         self.block.clear();
+        Ok(())
+    }
+}
+
+/// The `[Noise Data]` section.
+///
+/// Everything about a noise point's five columns is shared with v1 — the
+/// section is where the two versions differ, not its contents. What v1 has to
+/// *infer* from a frequency stepping backwards, v2 states with a keyword, so
+/// none of ADR 0007's boundary machinery applies here: there is no eager
+/// five-value test, no terminal-section rule, and no ambiguity to resolve.
+///
+/// Two consequences of that are worth stating, because they are departures
+/// from v1 rather than oversights:
+///
+/// - **A noise point must be one line.** Spec 2.0 p24 says each noise
+///   frequency and its data shall be grouped into a single line, and since the
+///   section is delimited there is no reason to be more permissive than the
+///   document: requiring it turns a truncated row into a message naming that
+///   row, where accumulating by count would silently merge it with the next
+///   and surface as a count mismatch pages later.
+/// - **The bound on the first noise frequency is not enforced.** The
+///   specification requires it to be no greater than the highest network
+///   frequency, and in v1 that sentence is load-bearing — it is the only way
+///   to find the section at all. Here the keyword has already found it, so a
+///   file that breaks the rule is still read exactly right, and rejecting it
+///   would discard good data for no diagnostic gain. ADR 0004's test does not
+///   bite, because there is no silently-wrong reading available.
+#[derive(Default)]
+struct NoisePoints {
+    data: crate::model::NoiseData,
+    /// Line `[Noise Data]` was found on, named in a malformed row's error
+    /// because that is usually where a reader's real question points.
+    starts_at: usize,
+}
+
+impl NoisePoints {
+    fn push_line(&mut self, content: &str, line: usize, scale: f64) -> Result<(), Error> {
+        let tokens: Vec<&str> = content.split_whitespace().collect();
+        let Ok(tokens) = <&[&str; NOISE_VALUES_PER_SET]>::try_from(&tokens[..]) else {
+            return Err(err(
+                line,
+                ParseErrorKind::MalformedNoiseLine {
+                    found: tokens.len(),
+                    noise_starts_at: self.starts_at,
+                },
+            ));
+        };
+
+        let mut values = [0.0f64; NOISE_VALUES_PER_SET];
+        for (value, token) in values.iter_mut().zip(tokens) {
+            *value = token
+                .parse()
+                .map_err(|_| err(line, ParseErrorKind::InvalidNumber(token.to_string())))?;
+        }
+        let (frequency, nfmin_db, gamma_opt, rn) =
+            noise_point_from_values(&values, scale, line, tokens[0])?;
+
+        if let Some(&previous) = self.data.freq_hz.last()
+            && frequency <= previous
+        {
+            return Err(err(
+                line,
+                ParseErrorKind::NoiseFrequencyNotAscending {
+                    previous_hz: previous,
+                    current_hz: frequency,
+                },
+            ));
+        }
+
+        self.data.freq_hz.push(frequency);
+        self.data.nfmin_db.push(nfmin_db);
+        self.data.gamma_opt.push(gamma_opt);
+        self.data.rn.push(rn);
+        // A 2.x file writes the effective noise resistance in ohms already —
+        // the one place the noise columns differ between versions, and the
+        // reason `rn_ohms` exists. See ADR 0010.
+        self.data.rn_ohms.push(rn);
         Ok(())
     }
 }

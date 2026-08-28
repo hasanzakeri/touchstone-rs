@@ -368,7 +368,7 @@ impl<'a> DataSets<'a> {
         let scale = opts.freq_unit.to_hz();
 
         if self.noise.is_some() {
-            return self.flush_noise(scale);
+            return self.flush_noise(scale, opts);
         }
 
         let n = match self.nports {
@@ -400,7 +400,7 @@ impl<'a> DataSets<'a> {
         if self.at_noise_boundary(n, opts) {
             self.noise = Some(NoiseData::default());
             self.noise_line = line;
-            return self.flush_noise(scale);
+            return self.flush_noise(scale, opts);
         }
 
         let expected = values_per_set(n, line)?;
@@ -450,7 +450,7 @@ impl<'a> DataSets<'a> {
     /// is already normalized; denormalizing here would invent a quantity the
     /// file does not contain and cost the writer its round trip. A v2 file
     /// writes the same column in ohms instead — see ADR 0010.
-    fn flush_noise(&mut self, scale: f64) -> Result<(), Error> {
+    fn flush_noise(&mut self, scale: f64, opts: &Options) -> Result<(), Error> {
         let line = self.block_line;
         let found = self.block.len();
         let Ok(values) = <&[f64; NOISE_VALUES_PER_SET]>::try_from(&self.block[..]) else {
@@ -485,6 +485,10 @@ impl<'a> DataSets<'a> {
         noise.nfmin_db.push(nfmin_db);
         noise.gamma_opt.push(gamma_opt);
         noise.rn.push(rn);
+        // Spec v1.1 §3 p11 normalizes `Rn` to the option line's `R`; the 2.1
+        // document adds that in a per-port option line it is *port 1's* value
+        // specifically. One value or several, that is `resistances[0]`.
+        noise.rn_ohms.push(rn * opts.resistances[0]);
         self.block.clear();
         Ok(())
     }

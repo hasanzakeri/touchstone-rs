@@ -29,6 +29,7 @@ pub struct NoiseData {
     nfmin_db: Py<PyArray1<f64>>,
     gamma_opt: Py<PyArray1<Complex64>>,
     rn: Py<PyArray1<f64>>,
+    rn_ohms: Py<PyArray1<f64>>,
 }
 
 #[pymethods]
@@ -51,10 +52,21 @@ impl NoiseData {
         self.gamma_opt.clone_ref(py)
     }
 
-    /// Effective noise resistance, normalized to the reference impedance.
+    /// Effective noise resistance exactly as the file writes it.
+    ///
+    /// Not the same quantity in every version: a Touchstone 1.0 or 1.1 file
+    /// normalizes it to the option line's reference resistance, while a 2.0 or
+    /// 2.1 file writes ohms. Use `rn_ohms` for a number whose meaning does not
+    /// depend on what wrote the file.
     #[getter]
     fn rn(&self, py: Python<'_>) -> Py<PyArray1<f64>> {
         self.rn.clone_ref(py)
+    }
+
+    /// Effective noise resistance in ohms, whatever the source version.
+    #[getter]
+    fn rn_ohms(&self, py: Python<'_>) -> Py<PyArray1<f64>> {
+        self.rn_ohms.clone_ref(py)
     }
 }
 
@@ -65,6 +77,7 @@ impl NoiseData {
             nfmin_db: noise.nfmin_db.into_pyarray(py).unbind(),
             gamma_opt: noise.gamma_opt.into_pyarray(py).unbind(),
             rn: noise.rn.into_pyarray(py).unbind(),
+            rn_ohms: noise.rn_ohms.into_pyarray(py).unbind(),
         }
     }
 }

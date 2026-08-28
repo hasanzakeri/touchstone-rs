@@ -775,12 +775,30 @@ fn gamma_opt_is_magnitude_and_angle_whatever_the_option_line_says() {
 /// against — and not converted to ohms. With `R 50` on the option line a
 /// denormalizing reader would report 17.5 and 21 here.
 ///
-/// This is an API promise, not an oversight: `z0` is on the same `Network`
-/// for anyone who wants ohms, and the writer needs the on-disk value back.
+/// This is an API promise, not an oversight: `rn_ohms` is beside it for anyone
+/// who wants ohms, and the writer needs the on-disk value back.
 #[test]
 fn rn_is_kept_normalized_the_way_the_file_writes_it() {
     let noise = noise_of(NOISY_TWO_PORT);
     assert_eq!(noise.rn, [0.35, 0.42]);
+}
+
+/// `rn_ohms` is the same quantity with the normalization undone, which for a
+/// 1.x file means multiplied by the option line's reference resistance.
+///
+/// It exists because a 2.x file writes this column in ohms already, so `rn`
+/// alone means two different things depending on what wrote the file — and a
+/// caller reading `rn` without knowing the version can be wrong by a factor of
+/// fifty without anything looking amiss. See ADR 0010.
+#[test]
+fn rn_ohms_undoes_the_normalization() {
+    assert_eq!(noise_of(NOISY_TWO_PORT).rn_ohms, [17.5, 21.0]);
+
+    // A 1.1 option line normalizes to *port 1's* resistance specifically, so
+    // the second port's value must not be the one used. Here they differ, so a
+    // reader that took the wrong one is caught.
+    let per_port = NOISY_TWO_PORT.replace("R 50", "R 50 75");
+    assert_eq!(noise_of(&per_port).rn_ohms, [17.5, 21.0]);
 }
 
 /// **The `<=` boundary.** Spec p10 says the first noise frequency is *less

@@ -152,6 +152,11 @@ pub enum ParseErrorKind {
         declared: usize,
         found: usize,
     },
+    /// A noise section in a file that is not 2-port. Noise parameters are
+    /// defined for 2-port networks only, in both spec versions.
+    NoiseRequiresTwoPorts {
+        nports: usize,
+    },
     /// Mixed-mode data, which this library does not read.
     MixedModeUnsupported,
     /// Content after `[End]`, which spec 2.0 p25 says to treat as an error.
@@ -268,6 +273,11 @@ impl fmt::Display for ParseErrorKind {
                 declared,
                 found,
             } => write!(f, "{keyword} declares {declared}, but the file has {found}"),
+            ParseErrorKind::NoiseRequiresTwoPorts { nports } => write!(
+                f,
+                "noise parameters are defined for 2-port networks only, but this \
+                 file has {nports} ports"
+            ),
             ParseErrorKind::MixedModeUnsupported => write!(
                 f,
                 "mixed-mode data is not supported: this file uses [Mixed-Mode Order], \
