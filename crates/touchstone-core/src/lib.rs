@@ -1,18 +1,25 @@
-//! Parser and writer for Touchstone `.sNp` files (versions 1.0 and 2.0).
+//! Parser and writer for Touchstone files (versions 1.0, 1.1, 2.0 and 2.1).
 //!
 //! Data is normalized on read: frequencies to Hz, network parameters to
 //! complex values regardless of the on-disk format (`RI`/`MA`/`DB`). The
 //! original option line is preserved in [`Metadata`] so writes can
 //! round-trip faithfully.
 //!
-//! This version reads Touchstone 1.0 files holding S-parameters in any of
-//! the three value formats, at any port count — including the wrapped
-//! multi-line layout that spec v1.1 §3 prescribes for 3-port and larger
-//! networks — and the optional noise-parameter section a 2-port file may
-//! append, which arrives in [`Network::noise`]. Other parameter types
-//! (`Y`/`Z`/`G`/`H`) are rejected with an error that names the limit.
-//! Parsing is strict by default: see
-//! `docs/adr/0004-strict-parsing-with-explicit-tolerances.md`.
+//! Both grammars are read, and which one a file uses is taken from the file
+//! rather than from the caller: a leading `[Version]` keyword selects the 2.0
+//! reader and its absence the 1.0 one.
+//!
+//! Covered: S-parameters in any of the three value formats at any port count,
+//! including the wrapped multi-line layout v1 prescribes for 3-port and larger
+//! networks; per-port reference resistances, whether from a 2.0 `[Reference]`
+//! keyword or a 1.1 option line; `[Matrix Format]` Full, Lower and Upper; and
+//! the noise-parameter section, which a 1.0 file appends with nothing to
+//! announce it and a 2.0 file marks with `[Noise Data]`. It arrives in
+//! [`Network::noise`] either way.
+//!
+//! Not covered: parameter types other than `S`, and mixed-mode data. Both are
+//! rejected with an error that names the limit. Parsing is strict by default:
+//! see `docs/adr/0004-strict-parsing-with-explicit-tolerances.md`.
 //!
 //! ```
 //! let net = touchstone_core::parse_str("# GHZ S RI R 50\n1.0 0.1 0.2 0.9 0.0 0.0 0.0 0.3 0.4\n")?;
