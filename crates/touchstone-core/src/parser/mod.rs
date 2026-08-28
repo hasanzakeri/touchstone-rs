@@ -15,9 +15,70 @@ use crate::error::{Error, ParseErrorKind};
 use crate::model::{Format, Parameter};
 use crate::option_line::Options;
 
+pub(crate) mod keyword;
 pub(crate) mod v1;
+pub(crate) mod v2;
 
-pub(crate) use v1::parse_v1;
+use crate::ParseOptions;
+use crate::lines::logical_lines;
+use crate::model::{Network, Version};
+use keyword::{Keyword, looks_like_keyword, parse_keyword_line};
+
+/// Read a file as whichever version it declares itself to be.
+///
+/// The rule comes straight from spec 2.0 p6: `[Version]` is required for every
+/// 2.0 file and shall precede all other non-comment, non-blank lines. So the
+/// **first line with content decides**, and nothing has to be scanned or
+/// guessed at — if it opens a keyword, that keyword must be `[Version]`;
+/// anything else is a 1.x file, which has no version marker of any kind.
+///
+/// Real exports put `[Version] 2.0` on line 1, ahead even of their comment
+/// header, so this is not a subtle reading of the rule.
+///
+/// A misplaced `[Version]` — after the option line, say — is reported by name
+/// rather than being searched for, because a file that has it in the wrong
+/// place is malformed either way and the two readings differ only in which
+/// error the reader is given.
+pub(crate) fn parse(input: &str, options: &ParseOptions) -> Result<Network, Error> {
+    match sniff_version(input)? {
+        Some(version) => v2::parse_v2(input, version, options),
+        None => v1::parse_v1(input, options),
+    }
+}
+
+/// The declared version, or `None` for a file with no `[Version]` keyword.
+fn sniff_version(input: &str) -> Result<Option<Version>, Error> {
+    let Some(line) = logical_lines(input).find(|line| !line.content.is_empty()) else {
+        return Ok(None);
+    };
+    if !looks_like_keyword(line.content) {
+        return Ok(None);
+    }
+
+    let keyword = parse_keyword_line(line.content, line.number)?;
+    if keyword.keyword != Keyword::Version {
+        return Err(err(
+            line.number,
+            ParseErrorKind::KeywordOutOfOrder {
+                keyword: keyword.keyword.as_str(),
+                detail: "[Version] must come first in a Touchstone 2.0 file",
+            },
+        ));
+    }
+
+    // The 2.1 document states that apart from this string, 2.1 files are
+    // identical to 2.0 files and that it makes no difference which is written.
+    // Both are therefore read by one parser, and kept apart only so a writer
+    // can reproduce what it read.
+    match keyword.argument {
+        "2.0" => Ok(Some(Version::V2_0)),
+        "2.1" => Ok(Some(Version::V2_1)),
+        other => Err(err(
+            line.number,
+            ParseErrorKind::UnsupportedVersion(other.to_string()),
+        )),
+    }
+}
 
 /// Values in one noise data set: frequency, NFmin, |Γopt|, ∠Γopt, Rn.
 ///

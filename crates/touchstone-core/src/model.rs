@@ -112,6 +112,58 @@ pub enum Version {
     V2_1,
 }
 
+/// Which entries of the matrix a v2 file writes, from `[Matrix Format]`.
+///
+/// `Lower` and `Upper` carry one triangle including the diagonal and leave the
+/// other half to symmetry, which spec 2.0 p11 notes suits interconnects — all
+/// ports are still represented, the file is simply smaller. A v1 file has no
+/// equivalent and is always `Full`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatrixFormat {
+    Full,
+    /// Lower triangle including the diagonal: `11`, `21 22`, `31 32 33`, …
+    Lower,
+    /// Upper triangle including the diagonal: `11 12 13`, `22 23`, `33`, …
+    Upper,
+}
+
+impl MatrixFormat {
+    /// The keyword argument for this format, in the spec's capitalization.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MatrixFormat::Full => "Full",
+            MatrixFormat::Lower => "Lower",
+            MatrixFormat::Upper => "Upper",
+        }
+    }
+}
+
+/// The order a 2-port file writes its off-diagonal entries in, from
+/// `[Two-Port Data Order]`.
+///
+/// The whole reason the keyword exists. Touchstone 1.0 writes S11 S21 S12 S22
+/// — 21 before 12, unlike every other port count — and enough tools adopted
+/// the natural row-major order instead that a 2-port v2 file has to say which
+/// it means. Guessing wrong transposes the matrix in silence, and no
+/// reciprocal device's data can reveal it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TwoPortOrder {
+    /// `21_12`: S11 S21 S12 S22, the Touchstone 1.0 convention.
+    S21First,
+    /// `12_21`: S11 S12 S21 S22, plain row-major.
+    S12First,
+}
+
+impl TwoPortOrder {
+    /// The keyword argument for this order, as the spec spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TwoPortOrder::S21First => "21_12",
+            TwoPortOrder::S12First => "12_21",
+        }
+    }
+}
+
 /// Source-file details preserved for faithful round-tripping.
 #[derive(Debug, Clone)]
 pub struct Metadata {
@@ -127,6 +179,18 @@ pub struct Metadata {
     /// port and every frequency, and in a v2 file `[Reference]` may have
     /// overridden this entirely.
     pub resistances: Vec<f64>,
+    /// The `[Reference]` values, when a v2 file gave them. `None` means the
+    /// option line's `R` supplied the reference instead, which a writer needs
+    /// to know in order to reproduce the file rather than merely its numbers.
+    pub reference: Option<Vec<f64>>,
+    /// Which entries the file wrote, from `[Matrix Format]`. `None` when the
+    /// keyword was absent — v2 defaults it to `Full`, and v1 has no such
+    /// keyword at all, so this records that nothing said so.
+    pub matrix_format: Option<MatrixFormat>,
+    /// The order a 2-port file wrote its off-diagonal entries in. `Some` only
+    /// for a v2 2-port file, where `[Two-Port Data Order]` is mandatory; a v1
+    /// file always uses [`TwoPortOrder::S21First`] without saying so.
+    pub two_port_order: Option<TwoPortOrder>,
     /// The option line as it appeared in the file, if any — trimmed, with
     /// any trailing `!` comment stripped, but otherwise verbatim (original
     /// spacing and case intact) so a write can reproduce the source style.
@@ -147,6 +211,9 @@ impl Default for Metadata {
             parameter: Parameter::S,
             format: Format::Ma,
             resistances: vec![50.0],
+            reference: None,
+            matrix_format: None,
+            two_port_order: None,
             option_line: None,
             comments: Vec::new(),
         }

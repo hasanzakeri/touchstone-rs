@@ -30,7 +30,9 @@ mod option_line;
 mod parser;
 
 pub use error::{Error, ParseErrorKind};
-pub use model::{Format, FreqUnit, Metadata, Network, NoiseData, Parameter, Version};
+pub use model::{
+    Format, FreqUnit, MatrixFormat, Metadata, Network, NoiseData, Parameter, TwoPortOrder, Version,
+};
 pub use num_complex::Complex64;
 
 /// Knobs that change how a file is read.
@@ -73,8 +75,12 @@ pub fn parse_str(input: &str) -> Result<Network, Error> {
 }
 
 /// Parse a Touchstone file from a string with explicit options.
+///
+/// The version is taken from the file: a leading `[Version]` keyword selects
+/// the 2.0 reader, and its absence the 1.0 one. Nothing here has to be told
+/// which to expect.
 pub fn parse_str_with(input: &str, options: &ParseOptions) -> Result<Network, Error> {
-    parser::parse_v1(input, options)
+    parser::parse(input, options)
 }
 
 /// Read and parse a Touchstone file from disk.

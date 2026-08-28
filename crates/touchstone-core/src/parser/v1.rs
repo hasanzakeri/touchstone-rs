@@ -20,6 +20,7 @@
 
 use num_complex::Complex64;
 
+use super::keyword::{looks_like_keyword, parse_keyword_line};
 use super::{
     NOISE_VALUES_PER_SET, broadcast_reference, check_option_scope, err, noise_point_from_values,
     reference_per_port, to_complex, values_per_set,
@@ -84,6 +85,19 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
                 option_line_number = Some(line.number);
             }
             continue;
+        }
+
+        // A `[` can only ever have been meant as a keyword: no data line
+        // starts with one. Keywords are not permitted in 1.x files at all, so
+        // this is either a 2.0 file whose `[Version]` is missing or misplaced,
+        // or a typo in one. Either way the reader needs to be told that, and
+        // not that some line holds an unparseable number.
+        if looks_like_keyword(line.content) {
+            let keyword = parse_keyword_line(line.content, line.number)?;
+            return Err(err(
+                line.number,
+                ParseErrorKind::V2KeywordInV1File(keyword.keyword.as_str()),
+            ));
         }
 
         let opts_ref = options
@@ -152,6 +166,13 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
             parameter: opts_ref.parameter,
             format: opts_ref.format,
             resistances: opts_ref.resistances,
+            // All three are v2 keywords, so a v1 file says nothing about any
+            // of them. A v1 2-port is always `S21First` and always Full, but
+            // it never *states* that, and `None` is what records the
+            // difference between a file that said so and one that did not.
+            reference: None,
+            matrix_format: None,
+            two_port_order: None,
             option_line,
             comments,
         },

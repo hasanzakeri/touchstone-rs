@@ -1,0 +1,799 @@
+//! The Touchstone 2.0 parser (and 2.1, which is the same grammar).
+//!
+//! Where [`super::v1`] infers, this reads. A v2 file states its port count,
+//! its frequency count, which entries of the matrix it wrote and — for a
+//! 2-port — which order it wrote them in, so nothing here has to be deduced
+//! from the shape of the data. The parser is a state machine over the keyword
+//! sequence rather than a set of heuristics, and the one thing it borrows from
+//! v1 is the arithmetic in [`super`].
+//!
+//! The consequence for data lines is spec 2.0 p13: a frequency point may be
+//! split across any number of lines or written on one line of any length, and
+//! a new point begins every `2n² + 1` values for a Full matrix, `n² + n + 1`
+//! for a triangular one. Counting values is exact here in a way it never was
+//! for v1, because the port count and the matrix format are given rather than
+//! guessed — so ADR 0006's odd/even rule has no job in this module.
+
+use num_complex::Complex64;
+
+use super::keyword::{Keyword, KeywordLine, looks_like_keyword, parse_keyword_line};
+use super::{
+    broadcast_reference, check_option_scope, err, reference_per_port, to_complex, values_per_point,
+};
+use crate::ParseOptions;
+use crate::error::{Error, ParseErrorKind};
+use crate::lines::{LogicalLine, has_cr_only_line_endings, logical_lines};
+use crate::model::{Format, MatrixFormat, Metadata, Network, TwoPortOrder, Version};
+use crate::option_line::{Options, parse_option_line};
+
+/// Parse a Touchstone 2.0 or 2.1 file.
+///
+/// `version` has already been established by the caller's sniff, which is what
+/// routed the file here at all.
+pub(crate) fn parse_v2(
+    input: &str,
+    version: Version,
+    _opts: &ParseOptions,
+) -> Result<Network, Error> {
+    if has_cr_only_line_endings(input) {
+        return Err(err(1, ParseErrorKind::UnsupportedLineEndings));
+    }
+
+    let mut header = Header::new(version);
+    let mut lines = logical_lines(input);
+
+    // The header runs until `[Network Data]`. Everything the data reader needs
+    // is settled by then, which is the whole point of the keyword block.
+    let data_starts_at = header.read(&mut lines)?;
+    let plan = header.finish(data_starts_at)?;
+    let mut data = NetworkData::new(&plan);
+    let mut ended = false;
+
+    for line in lines {
+        if line.content.is_empty() {
+            continue;
+        }
+        if !ended && looks_like_keyword(line.content) {
+            let keyword = parse_keyword_line(line.content, line.number)?;
+            match keyword.keyword {
+                Keyword::End => {
+                    ended = true;
+                    continue;
+                }
+                other => {
+                    return Err(err(
+                        line.number,
+                        ParseErrorKind::KeywordOutOfOrder {
+                            keyword: other.as_str(),
+                            detail: "network data has already begun",
+                        },
+                    ));
+                }
+            }
+        }
+        if ended {
+            // Spec 2.0 p25: `[End]` defines the end of the file, and
+            // non-comment text after it is an error. Comments are not,
+            // and never reach here — they have no content.
+            return Err(err(line.number, ParseErrorKind::TrailingDataAfterEnd));
+        }
+        data.push_line(line.content, line.number, &plan)?;
+    }
+
+    // A partly-read point is a truncated file. Reported as the value count it
+    // is, against the line the point began on.
+    if !data.block.is_empty() {
+        return Err(err(
+            data.block_line,
+            ParseErrorKind::WrongValueCount {
+                expected: plan.values_per_point,
+                found: data.block.len(),
+            },
+        ));
+    }
+    if data.freq_hz.len() != plan.nfreqs {
+        return Err(err(
+            plan.data_starts_at,
+            ParseErrorKind::DeclaredCountMismatch {
+                keyword: Keyword::NumberOfFrequencies.as_str(),
+                declared: plan.nfreqs,
+                found: data.freq_hz.len(),
+            },
+        ));
+    }
+
+    let z0 = broadcast_reference(&plan.reference, data.freq_hz.len());
+    Ok(Network {
+        freq_hz: data.freq_hz,
+        s: data.s,
+        nports: plan.nports,
+        z0,
+        noise: None,
+        metadata: plan.metadata,
+    })
+}
+
+/// Everything the data reader needs, fixed before the first value is read.
+struct Plan {
+    nports: usize,
+    nfreqs: usize,
+    /// Reference impedance per port, from `[Reference]` or the option line.
+    reference: Vec<f64>,
+    /// Where each pair of a data set belongs in the `(row, column)` matrix.
+    /// Its length is the number of pairs a point holds.
+    entry_order: Vec<(usize, usize)>,
+    /// Whether an entry off the diagonal also fills its transpose, which is
+    /// what makes a triangular file describe a whole matrix.
+    mirror: bool,
+    values_per_point: usize,
+    format: Format,
+    freq_scale: f64,
+    data_starts_at: usize,
+    metadata: Metadata,
+}
+
+/// The keyword block: read once, in any order the spec permits, then frozen
+/// into a [`Plan`].
+struct Header {
+    version: Version,
+    options: Option<Options>,
+    option_line: Option<String>,
+    option_line_at: usize,
+    nports: Option<usize>,
+    nfreqs: Option<usize>,
+    nnoise: Option<usize>,
+    reference: Option<Vec<f64>>,
+    matrix_format: Option<MatrixFormat>,
+    two_port_order: Option<TwoPortOrder>,
+    comments: Vec<String>,
+    /// Line each keyword was seen on, for the duplicate check's message.
+    seen: Vec<Keyword>,
+}
+
+impl Header {
+    fn new(version: Version) -> Self {
+        Header {
+            version,
+            options: None,
+            option_line: None,
+            option_line_at: 0,
+            nports: None,
+            nfreqs: None,
+            nnoise: None,
+            reference: None,
+            matrix_format: None,
+            two_port_order: None,
+            comments: Vec::new(),
+            seen: Vec::new(),
+        }
+    }
+
+    /// Consume lines up to and including `[Network Data]`, returning the line
+    /// it was found on.
+    fn read<'a>(
+        &mut self,
+        lines: &mut impl Iterator<Item = LogicalLine<'a>>,
+    ) -> Result<usize, Error> {
+        while let Some(line) = lines.next() {
+            if line.content.is_empty() {
+                // Only header comments are kept, exactly as in v1: files carry
+                // a comment on every data row and retaining hundreds of them
+                // costs allocations no consumer wants.
+                if let Some(text) = line.comment {
+                    self.comments.push(text.to_string());
+                }
+                continue;
+            }
+
+            if let Some(body) = line.content.strip_prefix('#') {
+                if self.options.is_some() {
+                    // Spec 2.0 p6: option lines after the first are ignored.
+                    continue;
+                }
+                let parsed = parse_option_line(body, line.number)?;
+                check_option_scope(&parsed, line.number)?;
+                self.options = Some(parsed);
+                self.option_line = Some(line.content.to_string());
+                self.option_line_at = line.number;
+                continue;
+            }
+
+            if !looks_like_keyword(line.content) {
+                // Data has arrived in the header. Which of the two things is
+                // missing depends on how far the header got: with no option
+                // line the file cannot be interpreted at all, and with one it
+                // is `[Network Data]` that should have come first.
+                return Err(err(
+                    line.number,
+                    if self.options.is_none() {
+                        ParseErrorKind::DataBeforeOptionLine
+                    } else {
+                        ParseErrorKind::MissingKeyword(Keyword::NetworkData.as_str())
+                    },
+                ));
+            }
+
+            let keyword = parse_keyword_line(line.content, line.number)?;
+            if keyword.keyword == Keyword::Version {
+                // The dispatcher has already read this line — it is what
+                // routed the file here — so it is expected rather than
+                // rejected. It must still be the first thing in the file,
+                // which is what makes the dispatcher's single-line sniff a
+                // complete reading of the rule rather than a shortcut.
+                if self.options.is_some() || !self.seen.is_empty() {
+                    return Err(err(
+                        line.number,
+                        ParseErrorKind::KeywordOutOfOrder {
+                            keyword: Keyword::Version.as_str(),
+                            detail: "it must precede every other non-comment line",
+                        },
+                    ));
+                }
+                self.claim(Keyword::Version, line.number)?;
+                continue;
+            }
+            if keyword.keyword == Keyword::NetworkData {
+                self.claim(Keyword::NetworkData, line.number)?;
+                return Ok(line.number);
+            }
+            self.apply(keyword, line.number, lines)?;
+        }
+        Err(err(
+            1,
+            ParseErrorKind::MissingKeyword(Keyword::NetworkData.as_str()),
+        ))
+    }
+
+    /// Record that `keyword` has been seen, rejecting a second occurrence.
+    fn claim(&mut self, keyword: Keyword, line: usize) -> Result<(), Error> {
+        if self.seen.contains(&keyword) {
+            return Err(err(
+                line,
+                ParseErrorKind::DuplicateKeyword(keyword.as_str()),
+            ));
+        }
+        self.seen.push(keyword);
+        Ok(())
+    }
+
+    /// Apply one header keyword.
+    fn apply<'a>(
+        &mut self,
+        line: KeywordLine<'_>,
+        at: usize,
+        rest: &mut impl Iterator<Item = LogicalLine<'a>>,
+    ) -> Result<(), Error> {
+        let name = line.keyword.as_str();
+        self.claim(line.keyword, at)?;
+
+        // Every keyword below `[Number of Ports]` needs the port count, and
+        // the spec puts it first for exactly that reason.
+        let needs_ports = matches!(
+            line.keyword,
+            Keyword::Reference | Keyword::TwoPortDataOrder | Keyword::MixedModeOrder
+        );
+        if needs_ports && self.nports.is_none() {
+            return Err(err(
+                at,
+                ParseErrorKind::KeywordOutOfOrder {
+                    keyword: name,
+                    detail: "it must follow [Number of Ports]",
+                },
+            ));
+        }
+
+        match line.keyword {
+            Keyword::Version => unreachable!("handled by the caller"),
+            Keyword::NumberOfPorts => {
+                if self.options.is_none() {
+                    return Err(err(
+                        at,
+                        ParseErrorKind::KeywordOutOfOrder {
+                            keyword: name,
+                            detail: "it must follow the option line",
+                        },
+                    ));
+                }
+                let nports = positive_integer(line.argument, name, at)?;
+                // Rejected here rather than where the multiplication would
+                // wrap: a count this large cannot describe a file that fits on
+                // a disk, so there is nothing to be gained by reading on.
+                values_per_point(nports)
+                    .ok_or_else(|| err(at, ParseErrorKind::UnusablePortCount { nports }))?;
+                self.nports = Some(nports);
+            }
+            Keyword::NumberOfFrequencies => {
+                self.nfreqs = Some(positive_integer(line.argument, name, at)?);
+            }
+            Keyword::NumberOfNoiseFrequencies => {
+                self.nnoise = Some(positive_integer(line.argument, name, at)?);
+            }
+            Keyword::TwoPortDataOrder => {
+                let nports = self.nports.expect("checked above");
+                if nports != 2 {
+                    return Err(err(
+                        at,
+                        ParseErrorKind::KeywordNotPermitted {
+                            keyword: name,
+                            detail: format!("this file has {nports} ports, not 2"),
+                        },
+                    ));
+                }
+                self.two_port_order = Some(match line.argument {
+                    "21_12" => TwoPortOrder::S21First,
+                    "12_21" => TwoPortOrder::S12First,
+                    other => {
+                        return Err(err(
+                            at,
+                            ParseErrorKind::InvalidKeywordArgument {
+                                keyword: name,
+                                detail: format!("expected 21_12 or 12_21, found '{other}'"),
+                            },
+                        ));
+                    }
+                });
+            }
+            Keyword::MatrixFormat => {
+                self.matrix_format = Some(match line.argument.to_ascii_lowercase().as_str() {
+                    "full" => MatrixFormat::Full,
+                    "lower" => MatrixFormat::Lower,
+                    "upper" => MatrixFormat::Upper,
+                    // Quoting `line.argument`, not the lowercased copy the
+                    // match ran on, so the reader sees their own spelling.
+                    _ => {
+                        return Err(err(
+                            at,
+                            ParseErrorKind::InvalidKeywordArgument {
+                                keyword: name,
+                                detail: format!(
+                                    "expected Full, Lower or Upper, found '{}'",
+                                    line.argument
+                                ),
+                            },
+                        ));
+                    }
+                });
+            }
+            Keyword::Reference => {
+                let nports = self.nports.expect("checked above");
+                self.reference = Some(read_reference(line.argument, nports, at, rest)?);
+            }
+            Keyword::MixedModeOrder => return Err(err(at, ParseErrorKind::MixedModeUnsupported)),
+            Keyword::BeginInformation => skip_information_block(at, rest)?,
+            Keyword::EndInformation => {
+                return Err(err(
+                    at,
+                    ParseErrorKind::KeywordOutOfOrder {
+                        keyword: name,
+                        detail: "there is no [Begin Information] before it",
+                    },
+                ));
+            }
+            Keyword::NoiseData | Keyword::End => {
+                return Err(err(
+                    at,
+                    ParseErrorKind::KeywordOutOfOrder {
+                        keyword: name,
+                        detail: "it must follow [Network Data]",
+                    },
+                ));
+            }
+            Keyword::NetworkData => unreachable!("handled by the caller"),
+        }
+        Ok(())
+    }
+
+    /// Freeze the header into the plan the data reader runs on.
+    fn finish(self, data_starts_at: usize) -> Result<Plan, Error> {
+        let options = self
+            .options
+            .ok_or_else(|| err(data_starts_at, ParseErrorKind::MissingOptionLine))?;
+        let nports = self.nports.ok_or_else(|| {
+            err(
+                data_starts_at,
+                ParseErrorKind::MissingKeyword(Keyword::NumberOfPorts.as_str()),
+            )
+        })?;
+        let nfreqs = self.nfreqs.ok_or_else(|| {
+            err(
+                data_starts_at,
+                ParseErrorKind::MissingKeyword(Keyword::NumberOfFrequencies.as_str()),
+            )
+        })?;
+
+        // Required for a 2-port and prohibited otherwise (spec 2.0 p8). The
+        // prohibition is enforced where the keyword is read; this is the other
+        // half.
+        if nports == 2 && self.two_port_order.is_none() {
+            return Err(err(
+                data_starts_at,
+                ParseErrorKind::MissingKeyword(Keyword::TwoPortDataOrder.as_str()),
+            ));
+        }
+
+        let matrix_format = self.matrix_format.unwrap_or(MatrixFormat::Full);
+        let reference = match &self.reference {
+            // Spec 2.0 p10: `[Reference]` supersedes the option line's `R`.
+            Some(values) => values.clone(),
+            None => reference_per_port(
+                &options.resistances,
+                nports,
+                "the option line",
+                self.option_line_at,
+            )?,
+        };
+
+        let entry_order = entry_order(nports, matrix_format, self.two_port_order);
+        Ok(Plan {
+            nports,
+            nfreqs,
+            reference,
+            values_per_point: 1 + 2 * entry_order.len(),
+            mirror: matrix_format != MatrixFormat::Full,
+            entry_order,
+            format: options.format,
+            freq_scale: options.freq_unit.to_hz(),
+            data_starts_at,
+            metadata: Metadata {
+                version: self.version,
+                freq_unit: options.freq_unit,
+                parameter: options.parameter,
+                format: options.format,
+                resistances: options.resistances,
+                reference: self.reference,
+                matrix_format: self.matrix_format,
+                two_port_order: self.two_port_order,
+                option_line: self.option_line,
+                comments: self.comments,
+            },
+        })
+    }
+}
+
+/// Where each pair of a data set belongs, in the order the file writes them.
+///
+/// Spec 2.0 pp16–17 for the triangles: data stays row-wise, "row" meaning the
+/// matrix's rows rather than the file's lines. Lower runs `11`, `21 22`,
+/// `31 32 33`; Upper runs `11 12 13`, `22 23`, `33`.
+///
+/// The 2-port Full case is the one that carries `[Two-Port Data Order]`, and
+/// it is the only place in the format where the file order is not row-major.
+/// The triangular 2-port cases need no such distinction: they hold three pairs
+/// whose off-diagonal entry fills both halves, so the two orders describe the
+/// same matrix — which is why spec 2.0 p14 can say Lower and Upper are
+/// identical at two ports.
+fn entry_order(
+    nports: usize,
+    matrix_format: MatrixFormat,
+    two_port_order: Option<TwoPortOrder>,
+) -> Vec<(usize, usize)> {
+    if nports == 2
+        && matrix_format == MatrixFormat::Full
+        && two_port_order == Some(TwoPortOrder::S21First)
+    {
+        // S11 S21 S12 S22 — 21 before 12, as Touchstone 1.0 writes it.
+        return vec![(0, 0), (1, 0), (0, 1), (1, 1)];
+    }
+    match matrix_format {
+        MatrixFormat::Full => (0..nports)
+            .flat_map(|row| (0..nports).map(move |col| (row, col)))
+            .collect(),
+        MatrixFormat::Lower => (0..nports)
+            .flat_map(|row| (0..=row).map(move |col| (row, col)))
+            .collect(),
+        MatrixFormat::Upper => (0..nports)
+            .flat_map(|row| (row..nports).map(move |col| (row, col)))
+            .collect(),
+    }
+}
+
+/// Accumulates values into frequency points.
+struct NetworkData {
+    freq_hz: Vec<f64>,
+    s: Vec<Complex64>,
+    block: Vec<f64>,
+    /// Source line the current point started on, so a wrapped point's error
+    /// points at its beginning.
+    block_line: usize,
+    /// The token that became the current point's frequency, quoted back when
+    /// it turns out to be unusable.
+    frequency_token: String,
+}
+
+impl NetworkData {
+    fn new(plan: &Plan) -> Self {
+        NetworkData {
+            freq_hz: Vec::with_capacity(plan.nfreqs),
+            s: Vec::with_capacity(plan.nfreqs * plan.nports * plan.nports),
+            block: Vec::with_capacity(plan.values_per_point),
+            block_line: 0,
+            frequency_token: String::new(),
+        }
+    }
+
+    fn push_line(&mut self, content: &str, line: usize, plan: &Plan) -> Result<(), Error> {
+        for token in content.split_whitespace() {
+            if self.block.is_empty() {
+                self.block_line = line;
+                self.frequency_token.clear();
+                self.frequency_token.push_str(token);
+            }
+            let value: f64 = token
+                .parse()
+                .map_err(|_| err(line, ParseErrorKind::InvalidNumber(token.to_string())))?;
+            self.block.push(value);
+
+            // A point is complete the moment it is full. Line breaks carry no
+            // meaning here (spec 2.0 p13), so there is nothing else to wait
+            // for — and closing eagerly keeps an error next to its cause.
+            if self.block.len() == plan.values_per_point {
+                self.flush(plan)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, plan: &Plan) -> Result<(), Error> {
+        let line = self.block_line;
+        let frequency = self.block[0] * plan.freq_scale;
+        if !frequency.is_finite() {
+            return Err(err(
+                line,
+                ParseErrorKind::InvalidNumber(self.frequency_token.clone()),
+            ));
+        }
+        if let Some(&previous) = self.freq_hz.last()
+            && frequency <= previous
+        {
+            return Err(err(
+                line,
+                ParseErrorKind::FrequencyNotAscending {
+                    previous_hz: previous,
+                    current_hz: frequency,
+                },
+            ));
+        }
+
+        let n = plan.nports;
+        let base = self.s.len();
+        self.s.resize(base + n * n, Complex64::new(0.0, 0.0));
+        for (index, &(row, col)) in plan.entry_order.iter().enumerate() {
+            let (first, second) = (self.block[1 + 2 * index], self.block[2 + 2 * index]);
+            let value = to_complex(first, second, plan.format);
+            // Checked after conversion, not on the token: `-inf` in a `DB`
+            // magnitude is a zero-magnitude entry and converts to exactly
+            // zero. See ADR 0006.
+            if !value.is_finite() {
+                return Err(err(line, ParseErrorKind::NonFiniteValue { first, second }));
+            }
+            self.s[base + row * n + col] = value;
+            if plan.mirror && row != col {
+                self.s[base + col * n + row] = value;
+            }
+        }
+
+        self.freq_hz.push(frequency);
+        self.block.clear();
+        Ok(())
+    }
+}
+
+/// Read `[Reference]`'s arguments, which may continue onto following lines.
+///
+/// Spec 2.0 p10 allows the values to begin on the line after the keyword and
+/// to span several lines, and real exports use that freedom fully — one value
+/// per line, indented, each with its own trailing comment. Since the port
+/// count is known, the list is complete when it has that many values, and no
+/// terminator is needed.
+///
+/// This is a trap worth naming. Once comments are stripped, a `[Reference]`
+/// payload line is indistinguishable from a data line, so a reader that only
+/// looked for the keyword and then resumed its normal loop would silently take
+/// the reference values as a frequency point.
+fn read_reference<'a>(
+    argument: &str,
+    nports: usize,
+    at: usize,
+    rest: &mut impl Iterator<Item = LogicalLine<'a>>,
+) -> Result<Vec<f64>, Error> {
+    let keyword = Keyword::Reference.as_str();
+    let mut values: Vec<f64> = Vec::with_capacity(nports);
+    let push_all = |text: &str, line: usize, values: &mut Vec<f64>| -> Result<(), Error> {
+        for token in text.split_whitespace() {
+            let ohms: f64 = token
+                .parse()
+                .map_err(|_| err(line, ParseErrorKind::InvalidNumber(token.to_string())))?;
+            if !ohms.is_finite() || ohms <= 0.0 {
+                return Err(err(
+                    line,
+                    ParseErrorKind::InvalidKeywordArgument {
+                        keyword,
+                        detail: format!("reference impedances must be positive, found '{token}'"),
+                    },
+                ));
+            }
+            values.push(ohms);
+        }
+        Ok(())
+    };
+
+    push_all(argument, at, &mut values)?;
+    while values.len() < nports {
+        let Some(line) = rest.next() else {
+            break;
+        };
+        if line.content.is_empty() {
+            continue;
+        }
+        if looks_like_keyword(line.content) {
+            // The next keyword has arrived with the list still short. Reported
+            // against the list, not the keyword, because the list is what is
+            // wrong.
+            break;
+        }
+        push_all(line.content, line.number, &mut values)?;
+    }
+
+    if values.len() != nports {
+        return Err(err(
+            at,
+            ParseErrorKind::WrongResistanceCount {
+                source: keyword,
+                expected: nports,
+                found: values.len(),
+            },
+        ));
+    }
+    Ok(values)
+}
+
+/// Skip everything between `[Begin Information]` and `[End Information]`.
+///
+/// Spec 2.0 p26 reserves the block for future informational keywords and
+/// defines none, so there is nothing in it to read — but it still has to be
+/// stepped over rather than fallen into, since its contents are neither
+/// keywords we know nor data.
+fn skip_information_block<'a>(
+    at: usize,
+    rest: &mut impl Iterator<Item = LogicalLine<'a>>,
+) -> Result<(), Error> {
+    for line in rest.by_ref() {
+        if line.content.is_empty() || !looks_like_keyword(line.content) {
+            continue;
+        }
+        let keyword = parse_keyword_line(line.content, line.number)?;
+        if keyword.keyword == Keyword::EndInformation {
+            return Ok(());
+        }
+        return Err(err(
+            line.number,
+            ParseErrorKind::KeywordOutOfOrder {
+                keyword: keyword.keyword.as_str(),
+                detail: "[Begin Information] is still open",
+            },
+        ));
+    }
+    Err(err(
+        at,
+        ParseErrorKind::MissingKeyword(Keyword::EndInformation.as_str()),
+    ))
+}
+
+/// A keyword argument that has to be an integer greater than zero.
+fn positive_integer(argument: &str, keyword: &'static str, line: usize) -> Result<usize, Error> {
+    if argument.is_empty() {
+        return Err(err(
+            line,
+            ParseErrorKind::InvalidKeywordArgument {
+                keyword,
+                detail: "no argument given".to_string(),
+            },
+        ));
+    }
+    match argument.parse::<usize>() {
+        Ok(0) | Err(_) => Err(err(
+            line,
+            ParseErrorKind::InvalidKeywordArgument {
+                keyword,
+                detail: format!("expected an integer greater than 0, found '{argument}'"),
+            },
+        )),
+        Ok(value) => Ok(value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The order the file writes a 2-port's four pairs in, which is the whole
+    /// reason `[Two-Port Data Order]` exists.
+    #[test]
+    fn the_two_port_orders_are_transposes_of_each_other() {
+        assert_eq!(
+            entry_order(2, MatrixFormat::Full, Some(TwoPortOrder::S21First)),
+            [(0, 0), (1, 0), (0, 1), (1, 1)]
+        );
+        assert_eq!(
+            entry_order(2, MatrixFormat::Full, Some(TwoPortOrder::S12First)),
+            [(0, 0), (0, 1), (1, 0), (1, 1)]
+        );
+    }
+
+    /// Spec 2.0 p17's own worked 3-port layouts.
+    #[test]
+    fn triangular_orders_follow_the_specs_worked_example() {
+        assert_eq!(
+            entry_order(3, MatrixFormat::Lower, None),
+            [(0, 0), (1, 0), (1, 1), (2, 0), (2, 1), (2, 2)]
+        );
+        assert_eq!(
+            entry_order(3, MatrixFormat::Upper, None),
+            [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2)]
+        );
+    }
+
+    /// A triangle holds `n(n+1)/2` pairs, so a point is `n² + n + 1` values
+    /// against a Full matrix's `2n² + 1`.
+    #[test]
+    fn a_triangle_holds_half_the_matrix_plus_its_diagonal() {
+        for n in 1..=16usize {
+            let full = entry_order(n, MatrixFormat::Full, None).len();
+            let lower = entry_order(n, MatrixFormat::Lower, None).len();
+            let upper = entry_order(n, MatrixFormat::Upper, None).len();
+            assert_eq!(full, n * n, "{n}-port full");
+            assert_eq!(lower, n * (n + 1) / 2, "{n}-port lower");
+            assert_eq!(upper, lower, "{n}-port upper");
+            assert_eq!(1 + 2 * full, values_per_point(n).unwrap());
+            assert_eq!(1 + 2 * lower, n * n + n + 1);
+        }
+    }
+
+    /// Every entry of the matrix is covered exactly once by a triangle plus
+    /// its mirror — the property that makes a triangular file describe a whole
+    /// network rather than half of one.
+    #[test]
+    fn a_triangle_and_its_mirror_cover_every_entry() {
+        for format in [MatrixFormat::Lower, MatrixFormat::Upper] {
+            for n in 1..=6usize {
+                let mut covered = vec![0u8; n * n];
+                for (row, col) in entry_order(n, format, None) {
+                    covered[row * n + col] += 1;
+                    if row != col {
+                        covered[col * n + row] += 1;
+                    }
+                }
+                assert!(
+                    covered.iter().all(|&c| c == 1),
+                    "{format:?} {n}-port: {covered:?}"
+                );
+            }
+        }
+    }
+
+    /// At one port there is nothing to order or mirror, and all three formats
+    /// carry the single `11` entry — spec 2.0 p14 says so outright.
+    #[test]
+    fn one_port_is_the_same_in_every_matrix_format() {
+        for format in [MatrixFormat::Full, MatrixFormat::Lower, MatrixFormat::Upper] {
+            assert_eq!(entry_order(1, format, None), [(0, 0)], "{format:?}");
+        }
+    }
+
+    #[test]
+    fn a_count_argument_must_be_a_positive_integer() {
+        assert_eq!(positive_integer("4", "[k]", 1).unwrap(), 4);
+        for bad in ["0", "-1", "2.5", "four", ""] {
+            assert!(
+                matches!(
+                    positive_integer(bad, "[k]", 1),
+                    Err(Error::Parse {
+                        kind: ParseErrorKind::InvalidKeywordArgument { .. },
+                        ..
+                    })
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+}
