@@ -799,6 +799,20 @@ mod data_lines {
         assert_eq!(ok(&commented).nfreqs(), 1);
     }
 
+    /// A keyword after `[End]` is content after `[End]` like any other, which
+    /// is the accurate complaint whichever keyword it happens to be.
+    #[test]
+    fn a_keyword_after_end_is_also_data_after_end() {
+        for trailing in ["[End]", "[Network Data]", "[Noise Data]"] {
+            let input = format!("{MINIMAL}{trailing}\n");
+            assert_eq!(
+                kind(&input),
+                ParseErrorKind::TrailingDataAfterEnd,
+                "{trailing}"
+            );
+        }
+    }
+
     /// `[End]` is not required. Nothing becomes ambiguous without it — the
     /// data simply ends — and rejecting an otherwise complete file over a
     /// missing terminator would discard good data for no diagnostic gain.
@@ -994,6 +1008,18 @@ mod noise {
         ));
     }
 
+    /// A repeat is a repeat, not a misplacement. The ordering message would be
+    /// true — the network data has begun — and would send the reader looking
+    /// at where the section starts rather than at the line in front of them.
+    #[test]
+    fn a_second_noise_data_keyword_is_reported_as_a_duplicate() {
+        let input = EXAMPLE_20_V2.replace("[End]", "[Noise Data]\n[End]");
+        assert_eq!(
+            kind(&input),
+            ParseErrorKind::DuplicateKeyword("[Noise Data]")
+        );
+    }
+
     #[test]
     fn a_declared_noise_count_is_checked_against_the_rows() {
         let input = EXAMPLE_20_V2.replace(
@@ -1093,6 +1119,177 @@ mod noise {
             .replace("18 2.7 .46 -33 20", "40 2.7 .46 -33 20");
         let net = ok(&input);
         assert_eq!(net.noise.unwrap().freq_hz, [30e9, 40e9]);
+    }
+}
+
+/// A declared count is a claim, not a measurement, and everything the reader
+/// sizes from one scales as `n²` or `F·n²`.
+///
+/// These are the cases where believing the header costs more than the file
+/// could possibly be worth. They matter because a corrupt count is not an
+/// exotic input, and because the failure they used to produce was not a
+/// rejected file but a dead process: an allocation abort takes the Python
+/// interpreter with it, so a caller cannot catch it at all.
+mod declared_counts_are_bounded_by_the_file {
+    use super::*;
+
+    /// 118 bytes claiming a 40000-port network at 100000 frequencies. Believed,
+    /// that is a 2.5 PB matrix; the port count alone sizes an index table of
+    /// 1.6 billion entries before any data is read.
+    const ABSURD: &str = "\
+[Version] 2.0
+# GHZ S RI R 50
+[Number of Ports] 40000
+[Number of Frequencies] 100000
+[Network Data]
+1.0 0.1 0.2
+[End]
+";
+
+    #[test]
+    fn a_port_count_the_file_cannot_fill_is_refused_before_anything_is_sized() {
+        assert!(matches!(
+            kind(ABSURD),
+            ParseErrorKind::DeclaredShapeExceedsFile {
+                keyword: "[Number of Ports]",
+                values_per_point,
+                ..
+            } if values_per_point == 1 + 2 * 40000 * 40000
+        ));
+    }
+
+    /// The same claim with a believable frequency count. The port count alone
+    /// is enough to make the file impossible, so it is refused on that alone.
+    #[test]
+    fn the_port_count_is_checked_independently_of_the_frequency_count() {
+        let input = ABSURD.replace(
+            "[Number of Frequencies] 100000",
+            "[Number of Frequencies] 1",
+        );
+        assert!(matches!(
+            kind(&input),
+            ParseErrorKind::DeclaredShapeExceedsFile { .. }
+        ));
+    }
+
+    /// A plausible port count with an enormous frequency count. Nothing here
+    /// is impossible per point, so the file is read and the count is caught
+    /// where the specification puts it — against the data actually present.
+    /// The reservation must not have been made on the declared figure, which
+    /// would overflow a `Vec`'s capacity before the first value was read.
+    #[test]
+    fn an_absurd_frequency_count_is_reported_against_the_data() {
+        let input = "\
+[Version] 2.0
+# GHZ S RI R 50
+[Number of Ports] 2
+[Two-Port Data Order] 21_12
+[Number of Frequencies] 5000000000000000000
+[Network Data]
+1.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8
+[End]
+";
+        assert_eq!(
+            kind(input),
+            ParseErrorKind::DeclaredCountMismatch {
+                keyword: "[Number of Frequencies]",
+                declared: 5_000_000_000_000_000_000,
+                found: 1,
+            }
+        );
+    }
+
+    /// The bound must not get in the way of a file that is merely large. A
+    /// 16-port point is 513 values, and a file holding several of them has
+    /// room for them by construction.
+    #[test]
+    fn an_honest_file_is_unaffected_by_the_bound() {
+        let mut input = String::from(
+            "[Version] 2.0\n# GHZ S RI R 50\n[Number of Ports] 16\n\
+             [Number of Frequencies] 3\n[Network Data]\n",
+        );
+        for f in 1..=3 {
+            input.push_str(&format!("{f}.0"));
+            for _ in 0..256 {
+                input.push_str(" 0.1 0.2");
+            }
+            input.push('\n');
+        }
+        input.push_str("[End]\n");
+
+        let net = ok(&input);
+        assert_eq!(net.nports, 16);
+        assert_eq!(net.nfreqs(), 3);
+        assert_eq!(net.s.len(), 3 * 256);
+    }
+}
+
+/// Rules that hold before the version is even known.
+mod before_the_version_is_known {
+    use super::*;
+
+    /// A carriage-return-only file is one enormous line, so the version sniff
+    /// would take the whole file as the `[Version]` argument and quote it back
+    /// — an error message that grows with the input. The check belongs ahead of
+    /// the sniff, where it serves both grammars.
+    #[test]
+    fn carriage_return_only_endings_are_named_not_quoted() {
+        let input = MINIMAL.replace('\n', "\r");
+        let (line, kind) = fails(&input);
+        assert_eq!(line, 1);
+        assert_eq!(kind, ParseErrorKind::UnsupportedLineEndings);
+    }
+
+    /// The DOS end-of-file marker is stripped for both versions. No 2.0 file
+    /// is likely to carry one, but the tolerance costs nothing and its absence
+    /// produced a baffling complaint about data after `[End]`.
+    #[test]
+    fn a_trailing_dos_eof_marker_is_ignored_in_v2_as_well() {
+        let input = format!("{MINIMAL}\u{1a}\n");
+        assert_same_matrix(&ok(MINIMAL), &ok(&input), 0.0, "with vs without the marker");
+    }
+}
+
+/// `ParseOptions::nports` asserts a port count. A v2 file declares one. When
+/// they disagree, one of them is wrong.
+mod caller_supplied_port_count {
+    use super::*;
+    use touchstone_core::{ParseOptions, parse_str_with};
+
+    const TWO_PORT: &str = "\
+[Version] 2.0
+# GHZ S RI R 50
+[Number of Ports] 2
+[Two-Port Data Order] 21_12
+[Number of Frequencies] 1
+[Network Data]
+1.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8
+[End]
+";
+
+    #[test]
+    fn an_agreeing_assertion_is_accepted() {
+        let opts = ParseOptions::new().nports(2);
+        let net = parse_str_with(TWO_PORT, &opts).expect("2 == 2");
+        assert_eq!(net.nports, 2);
+    }
+
+    /// Silently honouring the file would make the option a no-op against its
+    /// own documentation, which says it asserts the count rather than
+    /// suggesting it. Silently honouring the caller would misread the data.
+    #[test]
+    fn a_disagreeing_assertion_is_reported() {
+        let opts = ParseOptions::new().nports(4);
+        match parse_str_with(TWO_PORT, &opts) {
+            Err(Error::Parse { kind, .. }) => assert_eq!(
+                kind,
+                ParseErrorKind::PortCountMismatch {
+                    requested: 4,
+                    declared: 2,
+                }
+            ),
+            other => panic!("expected a mismatch, got {other:?}"),
+        }
     }
 }
 

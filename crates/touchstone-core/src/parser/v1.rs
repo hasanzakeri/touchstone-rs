@@ -27,20 +27,16 @@ use super::{
 };
 use crate::ParseOptions;
 use crate::error::{Error, ParseErrorKind};
-use crate::lines::{has_cr_only_line_endings, logical_lines, without_trailing_eof_marker};
+use crate::lines::logical_lines;
 use crate::model::{Format, Metadata, Network, NoiseData, Version};
 use crate::option_line::{Options, parse_option_line};
 
 /// Parse a v1 Touchstone file.
+///
+/// The trailing DOS end-of-file marker and carriage-return-only line endings
+/// are both dealt with by [`super::parse`] before the version is known, since
+/// neither is a property of either grammar.
 pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Error> {
-    // A DOS-era exporter may sign off with a `0x1A`. It is not data, and it
-    // is not whitespace either, so it has to come off before tokenizing.
-    let input = without_trailing_eof_marker(input);
-
-    if has_cr_only_line_endings(input) {
-        return Err(err(1, ParseErrorKind::UnsupportedLineEndings));
-    }
-
     let mut comments: Vec<String> = Vec::new();
     let mut options: Option<Options> = None;
     let mut option_line: Option<String> = None;

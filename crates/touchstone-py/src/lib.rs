@@ -101,14 +101,18 @@ fn z0_values(obj: &Bound<'_, PyAny>) -> PyResult<(Vec<usize>, Vec<Complex64>)> {
             array.iter().map(|&r| Complex64::new(r, 0.0)).collect(),
         ));
     }
-    // A plain list or tuple, which is what a caller writes by hand.
-    let values: Vec<f64> = obj.extract().map_err(|_| {
-        PyValueError::new_err("z0 must be a real or complex array, or a sequence of numbers")
-    })?;
-    Ok((
-        vec![values.len()],
-        values.into_iter().map(|r| Complex64::new(r, 0.0)).collect(),
-    ))
+    // Anything else numeric: an integer array, a float32 one, a list, a tuple,
+    // a nested list. Converting through NumPy handles every dtype and every
+    // shape at once, where matching on dtypes one at a time would accept a
+    // 1-D integer array and reject a 2-D one for no reason a caller could see.
+    let converted = numpy::get_array_module(obj.py())?
+        .call_method1("asarray", (obj, "complex128"))
+        .map_err(|_| {
+            PyValueError::new_err("z0 must be an array or sequence of real or complex numbers")
+        })?;
+    let array = converted.extract::<numpy::PyReadonlyArrayDyn<'_, Complex64>>()?;
+    let array = array.as_array();
+    Ok((array.shape().to_vec(), array.iter().copied().collect()))
 }
 
 /// An N-port network sampled at F frequencies.

@@ -20,7 +20,7 @@ pub(crate) mod v1;
 pub(crate) mod v2;
 
 use crate::ParseOptions;
-use crate::lines::logical_lines;
+use crate::lines::{has_cr_only_line_endings, logical_lines, without_trailing_eof_marker};
 use crate::model::{Network, Version};
 use keyword::{Keyword, looks_like_keyword, parse_keyword_line};
 
@@ -40,6 +40,24 @@ use keyword::{Keyword, looks_like_keyword, parse_keyword_line};
 /// place is malformed either way and the two readings differ only in which
 /// error the reader is given.
 pub(crate) fn parse(input: &str, options: &ParseOptions) -> Result<Network, Error> {
+    // Both of these come before the version is known, because both are about
+    // the bytes rather than the grammar — and because the sniff below reads a
+    // line, which a file with no line breaks it recognizes does not have.
+    //
+    // A carriage-return-only file arrives as one enormous line. Left to the
+    // sniff, its entire contents become the `[Version]` argument and the error
+    // quotes the whole file back at the reader; the message grows with the
+    // input, which for a large file is its own problem.
+    if has_cr_only_line_endings(input) {
+        return Err(err(1, ParseErrorKind::UnsupportedLineEndings));
+    }
+    // A DOS-era exporter may sign off with a `0x1A`. It is not data and not
+    // whitespace, so it has to come off before tokenizing (ADR 0007). No 2.0
+    // file is likely to carry one, but stripping it here rather than in the v1
+    // parser costs nothing and spares the version that does not expect it a
+    // baffling "data after [End]".
+    let input = without_trailing_eof_marker(input);
+
     match sniff_version(input)? {
         Some(version) => v2::parse_v2(input, version, options),
         None => v1::parse_v1(input, options),

@@ -81,6 +81,64 @@ may share one line, and a point may be split mid-pair.
 used to drive the read. A file that disagrees with itself is reported, instead
 of quietly returning whichever of the two numbers happened to win.
 
+### A declared count may not size anything the file could not contain
+
+The counts in a v2 header are claims, and everything sized from them grows as
+`n²` or `F·n²`: the index table mapping each pair to its matrix entry, the
+matrix itself, the frequency vector. A hundred-byte file may legally *say*
+`[Number of Ports] 40000`, and believing it asks for an index table of 1.6
+billion entries and a matrix of two and a half petabytes.
+
+That is not a rejected file. It is an allocation abort, which in a Rust library
+is a dead process rather than an `Err` — and through the Python binding it
+takes the interpreter with it, so a caller cannot catch it at all. A corrupt
+count is not an exotic input, and "we validate it afterwards" is no defence
+when the process does not survive to get there.
+
+**So every declared count is bounded by the file itself before anything is
+sized from it.** A file of `len` bytes cannot hold more than `len / 2 + 1`
+whitespace-separated values, since each needs a byte and a separator. That
+ceiling is loose by design — it does not need to be tight, only finite and
+derived from something the file cannot lie about — and it is used two ways:
+
+- **The port count is checked against it and rejected outright** when a single
+  data point of the declared shape would need more values than the whole file
+  holds. Such a file is malformed however the rest of it reads, and this is
+  the check that has to come first, because the index table is the first thing
+  the port count gets to size.
+- **The frequency count only caps a reservation**, never a rejection. A file
+  may legitimately declare more points than it turns out to contain — that is
+  precisely what the mismatch check exists to report — so the count is still
+  believed as a *hint* for reserving capacity, just never beyond what the file
+  could hold. The arithmetic saturates rather than wrapping.
+
+The ordinary case is unaffected: a real file's declared counts are far below
+the ceiling, and the reservation is as useful as it ever was.
+
+### A caller's asserted port count is checked, not ignored
+
+`ParseOptions::nports` exists because a v1 file does not state its port count.
+A v2 file does. When a caller asserts one and the file declares another, the
+two disagree about what the data means and one of them is wrong, so the
+disagreement is reported.
+
+Honouring the file silently would make a documented assertion a no-op — the
+option's own documentation says it asserts the count rather than suggesting
+it. Honouring the caller would misread data that describes itself perfectly
+well. Neither is worth the quiet.
+
+### Two checks belong before the version is known
+
+Carriage-return-only line endings and the trailing DOS end-of-file marker are
+properties of the bytes, not of either grammar, so both are handled ahead of
+the version sniff rather than inside each parser.
+
+For the line endings this is not tidiness. Such a file has no line breaks the
+reader recognizes, so it arrives as one enormous line — and the sniff would
+take the entire file as the `[Version]` argument and quote it back in the
+error. The message would grow with the input, which for a large file is a
+second problem on top of the first.
+
 ### Two tolerances, stated
 
 - **A missing `[End]` is accepted.** The keyword marks the end of the file,
@@ -152,3 +210,12 @@ message that says so, rather than half-read.
   format makes easiest and most expensive.
 - **Enforce column 1 for keywords** by carrying the untrimmed line through.
   Costs a field on every logical line to reject files nothing is confused by.
+- **Impose a fixed ceiling on the port count** — the comparable Rust crate
+  stops at 32 — instead of bounding it by the file. Simpler, and it reintroduces
+  the arbitrary limit ADR 0006 declined to impose: the format says matrices are
+  of unlimited size, and a file large enough to hold a 200-port matrix should
+  read. Bounding by the file's own length rejects exactly the impossible cases
+  and nothing else.
+- **Reserve nothing and let the vectors grow.** Removes the problem by removing
+  the optimization, and gives up a real one — the declared counts are accurate
+  in every honest file, which is all of them.

@@ -5,10 +5,13 @@ from typing import Any, TypeAlias
 import numpy as np
 import numpy.typing as npt
 
-# Anything the z0 parameter accepts: a numeric array of any dtype, or a plain
-# sequence of numbers. Real input is widened -- the format's own reference
-# impedances are real, so a caller holding real values is the ordinary case.
-Z0Like: TypeAlias = npt.NDArray[np.number[Any]] | Sequence[complex]
+# Anything the z0 parameter accepts: a numeric array of any dtype, or a
+# sequence of numbers, in either accepted shape. Real input is widened -- the
+# format's own reference impedances are real, so a caller holding real values
+# is the ordinary case and should not have to convert.
+Z0Like: TypeAlias = (
+    npt.NDArray[np.number[Any]] | Sequence[complex] | Sequence[Sequence[complex]]
+)
 
 __version__: str
 

@@ -19,11 +19,11 @@ use num_complex::Complex64;
 use super::keyword::{Keyword, KeywordLine, looks_like_keyword, parse_keyword_line};
 use super::{
     NOISE_VALUES_PER_SET, broadcast_reference, check_option_scope, err, noise_point_from_values,
-    reference_per_port, to_complex, values_per_point,
+    reference_per_port, to_complex, values_per_point, values_per_set,
 };
 use crate::ParseOptions;
 use crate::error::{Error, ParseErrorKind};
-use crate::lines::{LogicalLine, has_cr_only_line_endings, logical_lines};
+use crate::lines::{LogicalLine, logical_lines};
 use crate::model::{Format, MatrixFormat, Metadata, Network, TwoPortOrder, Version};
 use crate::option_line::{Options, parse_option_line};
 
@@ -34,11 +34,20 @@ use crate::option_line::{Options, parse_option_line};
 pub(crate) fn parse_v2(
     input: &str,
     version: Version,
-    _opts: &ParseOptions,
+    opts: &ParseOptions,
 ) -> Result<Network, Error> {
-    if has_cr_only_line_endings(input) {
-        return Err(err(1, ParseErrorKind::UnsupportedLineEndings));
-    }
+    // The most values this file could possibly hold. Every token needs at
+    // least one byte and one separator, so a file of `len` bytes cannot carry
+    // more than `len / 2 + 1` of them.
+    //
+    // This exists because the header's counts are *declarations*, not
+    // measurements, and everything the reader sizes from them scales as `n²`
+    // or `F·n²`. A hundred-byte file naming forty thousand ports is asking for
+    // a matrix of two and a half petabytes; without a bound taken from the
+    // file itself, believing it aborts the process before a single data value
+    // has been read. The bound is loose — it does not have to be tight, only
+    // finite and derived from something the file cannot lie about.
+    let file_values = input.len() / 2 + 1;
 
     let mut header = Header::new(version);
     let mut lines = logical_lines(input);
@@ -47,9 +56,9 @@ pub(crate) fn parse_v2(
     // is settled by then, which is the whole point of the keyword block.
     let data_starts_at = header.read(&mut lines)?;
     let (declared_noise, noise_count_at) = (header.nnoise, header.nnoise_at);
-    let plan = header.finish(data_starts_at)?;
+    let plan = header.finish(data_starts_at, file_values, opts)?;
 
-    let mut data = NetworkData::new(&plan);
+    let mut data = NetworkData::new(&plan, file_values);
     let mut noise = NoisePoints::default();
     let mut section = Section::Network;
 
@@ -60,6 +69,20 @@ pub(crate) fn parse_v2(
         if looks_like_keyword(line.content) {
             let keyword = parse_keyword_line(line.content, line.number)?;
             match (keyword.keyword, section) {
+                // Anything at all past `[End]` is content past `[End]`, which
+                // is the accurate complaint whatever the keyword happens to be.
+                (_, Section::Ended) => {
+                    return Err(err(line.number, ParseErrorKind::TrailingDataAfterEnd));
+                }
+                // A second one of either, which is a repeat rather than a
+                // misplacement — the generic ordering message would be true
+                // and would send the reader looking in the wrong place.
+                (Keyword::NoiseData, Section::Noise) => {
+                    return Err(err(
+                        line.number,
+                        ParseErrorKind::DuplicateKeyword(Keyword::NoiseData.as_str()),
+                    ));
+                }
                 (Keyword::NoiseData, Section::Network) => {
                     data.check_complete(&plan)?;
                     if plan.nports != 2 {
@@ -448,7 +471,16 @@ impl Header {
     }
 
     /// Freeze the header into the plan the data reader runs on.
-    fn finish(self, data_starts_at: usize) -> Result<Plan, Error> {
+    ///
+    /// `file_values` is the most values the source could hold; it bounds the
+    /// declared port count before anything is sized from it. `opts` is checked
+    /// here too, since this is where the file's own count becomes known.
+    fn finish(
+        self,
+        data_starts_at: usize,
+        file_values: usize,
+        opts: &ParseOptions,
+    ) -> Result<Plan, Error> {
         let options = self
             .options
             .ok_or_else(|| err(data_starts_at, ParseErrorKind::MissingOptionLine))?;
@@ -475,7 +507,45 @@ impl Header {
             ));
         }
 
+        // A caller who asserts a port count and a file that declares a
+        // different one disagree about what the data means, and one of them is
+        // wrong. Saying so beats honouring either silently — the option is
+        // documented as asserting the count, not suggesting it.
+        if let Some(requested) = opts.nports
+            && requested != nports
+        {
+            return Err(err(
+                data_starts_at,
+                ParseErrorKind::PortCountMismatch {
+                    requested,
+                    declared: nports,
+                },
+            ));
+        }
+
         let matrix_format = self.matrix_format.unwrap_or(MatrixFormat::Full);
+
+        // Checked before `entry_order` is built, because that table holds one
+        // entry per matrix element and is the first thing the declared port
+        // count gets to size. A file too small to contain one data point of
+        // the shape it claims is malformed however the rest of it reads.
+        let values_per_point = match matrix_format {
+            MatrixFormat::Full => values_per_set(nports, data_starts_at)?,
+            // `n² + n + 1`, which is smaller than the Full count checked above
+            // and so cannot overflow where that one did not.
+            _ => nports * nports + nports + 1,
+        };
+        if values_per_point > file_values {
+            return Err(err(
+                data_starts_at,
+                ParseErrorKind::DeclaredShapeExceedsFile {
+                    keyword: Keyword::NumberOfPorts.as_str(),
+                    values_per_point,
+                    file_values,
+                },
+            ));
+        }
+
         let reference = match &self.reference {
             // Spec 2.0 p10: `[Reference]` supersedes the option line's `R`.
             Some(values) => values.clone(),
@@ -488,11 +558,12 @@ impl Header {
         };
 
         let entry_order = entry_order(nports, matrix_format, self.two_port_order);
+        debug_assert_eq!(values_per_point, 1 + 2 * entry_order.len());
         Ok(Plan {
             nports,
             nfreqs,
             reference,
-            values_per_point: 1 + 2 * entry_order.len(),
+            values_per_point,
             mirror: matrix_format != MatrixFormat::Full,
             entry_order,
             format: options.format,
@@ -565,10 +636,27 @@ struct NetworkData {
 }
 
 impl NetworkData {
-    fn new(plan: &Plan) -> Self {
+    /// `file_values` bounds every reservation below.
+    ///
+    /// `[Number of Frequencies]` is a declaration, and reserving on its word
+    /// alone lets a file of a few dozen bytes ask for an array of any size it
+    /// likes — which is not a rejected file but a dead process. Capping at what
+    /// the source could contain keeps the reservation useful for real files
+    /// and makes a false one unable to reserve anything the file could not
+    /// have held. A count that turns out to be a lie is still reported, by the
+    /// mismatch check at the end; this is only about not believing it early.
+    fn new(plan: &Plan, file_values: usize) -> Self {
+        let points = plan.nfreqs.min(file_values);
         NetworkData {
-            freq_hz: Vec::with_capacity(plan.nfreqs),
-            s: Vec::with_capacity(plan.nfreqs * plan.nports * plan.nports),
+            freq_hz: Vec::with_capacity(points),
+            // A point needs more values than it yields matrix entries, in
+            // every matrix format, so the same bound covers this too.
+            s: Vec::with_capacity(
+                points
+                    .saturating_mul(plan.nports)
+                    .saturating_mul(plan.nports)
+                    .min(file_values),
+            ),
             block: Vec::with_capacity(plan.values_per_point),
             block_line: 0,
             frequency_token: String::new(),

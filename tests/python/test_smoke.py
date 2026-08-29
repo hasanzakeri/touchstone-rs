@@ -66,16 +66,36 @@ def test_network_accepts_a_per_frequency_z0() -> None:
 
 def test_network_z0_accepts_real_input_and_plain_sequences() -> None:
     """Reference impedances are real in every published version of the format,
-    so a caller holding real values is the ordinary case, not an error."""
+    so a caller holding real values is the ordinary case, not an error.
+
+    Every numeric dtype and both accepted shapes go through one conversion, so
+    a 2-D integer array -- the natural way to hand over a per-frequency z0 --
+    is not refused where the 1-D one is accepted.
+    """
     f = np.array([1e9])
     s = np.zeros((1, 2, 2), dtype=np.complex128)
 
-    from_list = ts.Network(f, s, z0=[50.0, 75.0])
-    from_int_array = ts.Network(f, s, z0=np.array([50, 75]))
-
-    for net in (from_list, from_int_array):
+    for z0 in (
+        [50.0, 75.0],
+        (50, 75),
+        [[50, 75]],
+        np.array([50, 75]),
+        np.array([50, 75], dtype=np.float32),
+        np.array([[50, 75]]),
+        np.array([[50.0, 75.0]]),
+    ):
+        net = ts.Network(f, s, z0=z0)
         assert net.z0.dtype == np.complex128
         np.testing.assert_array_equal(net.z0, [[50 + 0j, 75 + 0j]])
+
+
+def test_network_z0_rejects_non_numeric_input() -> None:
+    f = np.array([1e9])
+    s = np.zeros((1, 2, 2), dtype=np.complex128)
+    with pytest.raises(ValueError, match="real or complex numbers"):
+        # Deliberately ill-typed. The stub already forbids this; what is being
+        # checked is that the runtime says so too, for callers without one.
+        ts.Network(f, s, z0="nonsense")  # pyright: ignore[reportArgumentType]
 
 
 def test_network_rejects_a_z0_that_fits_neither_shape() -> None:

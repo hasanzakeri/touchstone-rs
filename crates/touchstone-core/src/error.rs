@@ -152,6 +152,22 @@ pub enum ParseErrorKind {
         declared: usize,
         found: usize,
     },
+    /// A declared shape the file is far too small to contain even once: a
+    /// single data point would need more values than the whole file can hold.
+    ///
+    /// Caught before anything is sized from the declared count, because those
+    /// counts scale as `n²` and a file of a hundred bytes can name a port
+    /// count whose matrix would not fit in memory.
+    DeclaredShapeExceedsFile {
+        keyword: &'static str,
+        values_per_point: usize,
+        file_values: usize,
+    },
+    /// The caller asserted a port count that the file contradicts.
+    PortCountMismatch {
+        requested: usize,
+        declared: usize,
+    },
     /// A noise section in a file that is not 2-port. Noise parameters are
     /// defined for 2-port networks only, in both spec versions.
     NoiseRequiresTwoPorts {
@@ -273,6 +289,23 @@ impl fmt::Display for ParseErrorKind {
                 declared,
                 found,
             } => write!(f, "{keyword} declares {declared}, but the file has {found}"),
+            ParseErrorKind::DeclaredShapeExceedsFile {
+                keyword,
+                values_per_point,
+                file_values,
+            } => write!(
+                f,
+                "{keyword} implies {values_per_point} values per data point, but \
+                 the whole file holds at most {file_values}"
+            ),
+            ParseErrorKind::PortCountMismatch {
+                requested,
+                declared,
+            } => write!(
+                f,
+                "a {requested}-port network was requested, but [Number of Ports] \
+                 declares {declared}"
+            ),
             ParseErrorKind::NoiseRequiresTwoPorts { nports } => write!(
                 f,
                 "noise parameters are defined for 2-port networks only, but this \
