@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use numpy::{Complex64, IntoPyArray, PyArray1, PyArray3, PyArrayMethods};
+use numpy::{Complex64, IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayMethods};
 use pyo3::create_exception;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -29,6 +29,7 @@ pub struct NoiseData {
     nfmin_db: Py<PyArray1<f64>>,
     gamma_opt: Py<PyArray1<Complex64>>,
     rn: Py<PyArray1<f64>>,
+    rn_ohms: Py<PyArray1<f64>>,
 }
 
 #[pymethods]
@@ -51,10 +52,21 @@ impl NoiseData {
         self.gamma_opt.clone_ref(py)
     }
 
-    /// Effective noise resistance, normalized to the reference impedance.
+    /// Effective noise resistance exactly as the file writes it.
+    ///
+    /// Not the same quantity in every version: a Touchstone 1.0 or 1.1 file
+    /// normalizes it to the option line's reference resistance, while a 2.0 or
+    /// 2.1 file writes ohms. Use `rn_ohms` for a number whose meaning does not
+    /// depend on what wrote the file.
     #[getter]
     fn rn(&self, py: Python<'_>) -> Py<PyArray1<f64>> {
         self.rn.clone_ref(py)
+    }
+
+    /// Effective noise resistance in ohms, whatever the source version.
+    #[getter]
+    fn rn_ohms(&self, py: Python<'_>) -> Py<PyArray1<f64>> {
+        self.rn_ohms.clone_ref(py)
     }
 }
 
@@ -65,8 +77,42 @@ impl NoiseData {
             nfmin_db: noise.nfmin_db.into_pyarray(py).unbind(),
             gamma_opt: noise.gamma_opt.into_pyarray(py).unbind(),
             rn: noise.rn.into_pyarray(py).unbind(),
+            rn_ohms: noise.rn_ohms.into_pyarray(py).unbind(),
         }
     }
+}
+
+/// A caller-supplied `z0`, as its shape and a flat complex vector.
+///
+/// Three forms are accepted, and real ones are widened rather than refused:
+/// the specification's reference impedances are real, so a caller who has only
+/// ever seen a conforming file has no reason to hold complex values, and
+/// making them build some would be a tax on the ordinary case. The complex
+/// form exists for a solver's own per-frequency port impedance.
+fn z0_values(obj: &Bound<'_, PyAny>) -> PyResult<(Vec<usize>, Vec<Complex64>)> {
+    if let Ok(array) = obj.extract::<numpy::PyReadonlyArrayDyn<'_, Complex64>>() {
+        let array = array.as_array();
+        return Ok((array.shape().to_vec(), array.iter().copied().collect()));
+    }
+    if let Ok(array) = obj.extract::<numpy::PyReadonlyArrayDyn<'_, f64>>() {
+        let array = array.as_array();
+        return Ok((
+            array.shape().to_vec(),
+            array.iter().map(|&r| Complex64::new(r, 0.0)).collect(),
+        ));
+    }
+    // Anything else numeric: an integer array, a float32 one, a list, a tuple,
+    // a nested list. Converting through NumPy handles every dtype and every
+    // shape at once, where matching on dtypes one at a time would accept a
+    // 1-D integer array and reject a 2-D one for no reason a caller could see.
+    let converted = numpy::get_array_module(obj.py())?
+        .call_method1("asarray", (obj, "complex128"))
+        .map_err(|_| {
+            PyValueError::new_err("z0 must be an array or sequence of real or complex numbers")
+        })?;
+    let array = converted.extract::<numpy::PyReadonlyArrayDyn<'_, Complex64>>()?;
+    let array = array.as_array();
+    Ok((array.shape().to_vec(), array.iter().copied().collect()))
 }
 
 /// An N-port network sampled at F frequencies.
@@ -74,7 +120,7 @@ impl NoiseData {
 pub struct Network {
     f: Py<PyArray1<f64>>,
     s: Py<PyArray3<Complex64>>,
-    z0: Py<PyArray1<f64>>,
+    z0: Py<PyArray2<Complex64>>,
     #[pyo3(get)]
     nports: usize,
     noise: Option<Py<NoiseData>>,
@@ -83,14 +129,19 @@ pub struct Network {
 #[pymethods]
 impl Network {
     /// Build a network from arrays: `f` (F, Hz), `s` (F, N, N), and an
-    /// optional per-port `z0` (N, defaults to 50 Ω).
+    /// optional `z0`, either (N,) or (F, N), defaulting to 50 Ω.
+    ///
+    /// A one-dimensional `z0` is one value per port for the whole sweep — what
+    /// every Touchstone file declares — and is tiled across the frequencies
+    /// here so callers need not do it themselves. Real input is accepted and
+    /// widened, since the specification's own reference impedances are real.
     #[new]
     #[pyo3(signature = (f, s, z0=None))]
     fn new(
         py: Python<'_>,
         f: numpy::PyReadonlyArray1<'_, f64>,
         s: numpy::PyReadonlyArray3<'_, Complex64>,
-        z0: Option<numpy::PyReadonlyArray1<'_, f64>>,
+        z0: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let s_shape = s.as_array().shape().to_vec();
         let (nf, nports) = (s_shape[0], s_shape[1]);
@@ -105,17 +156,21 @@ impl Network {
                 "f has {f_len} points but s has {nf} frequency entries"
             )));
         }
-        let z0_vec = match &z0 {
+        let z0_flat: Vec<Complex64> = match z0 {
+            None => vec![Complex64::new(50.0, 0.0); nf * nports],
             Some(z0) => {
-                let z0_len = z0.as_array().len();
-                if z0_len != nports {
-                    return Err(PyValueError::new_err(format!(
-                        "z0 has {z0_len} entries for a {nports}-port network"
-                    )));
+                let (shape, values) = z0_values(&z0)?;
+                match shape.as_slice() {
+                    [n] if *n == nports => (0..nf).flat_map(|_| values.iter().copied()).collect(),
+                    [rows, cols] if *rows == nf && *cols == nports => values,
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "z0 must have shape ({nports},) or ({nf}, {nports}) for a \
+                             {nports}-port network at {nf} frequencies, got {other:?}"
+                        )));
+                    }
                 }
-                z0.as_array().to_vec()
             }
-            None => vec![50.0; nports],
         };
         let s_flat: Vec<Complex64> = s.as_array().iter().copied().collect();
         Ok(Network {
@@ -124,7 +179,7 @@ impl Network {
                 .into_pyarray(py)
                 .reshape([nf, nports, nports])?
                 .unbind(),
-            z0: z0_vec.into_pyarray(py).unbind(),
+            z0: z0_flat.into_pyarray(py).reshape([nf, nports])?.unbind(),
             nports,
             noise: None,
         })
@@ -142,9 +197,15 @@ impl Network {
         self.s.clone_ref(py)
     }
 
-    /// Per-port reference impedance, shape (N,), float64.
+    /// Reference impedance, shape (F, N), complex128.
+    ///
+    /// Per frequency and complex, though a conforming Touchstone file states
+    /// neither: its reference impedance is one real number per port for the
+    /// whole sweep, so every row comes back identical with a zero imaginary
+    /// part. The shape is what a field solver's own per-frequency port
+    /// impedance needs, and is fixed now so it will not have to change.
     #[getter]
-    fn z0(&self, py: Python<'_>) -> Py<PyArray1<f64>> {
+    fn z0(&self, py: Python<'_>) -> Py<PyArray2<Complex64>> {
         self.z0.clone_ref(py)
     }
 
@@ -178,7 +239,7 @@ impl Network {
         Ok(Network {
             f: net.freq_hz.into_pyarray(py).unbind(),
             s: net.s.into_pyarray(py).reshape([nf, n, n])?.unbind(),
-            z0: net.z0.into_pyarray(py).unbind(),
+            z0: net.z0.into_pyarray(py).reshape([nf, n])?.unbind(),
             nports: n,
             noise,
         })

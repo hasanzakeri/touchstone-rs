@@ -34,16 +34,75 @@ def test_network_from_arrays() -> None:
     assert net.s.dtype == np.complex128
     assert net.s.shape == (3, 2, 2)
     assert net.s[1, 1, 0] == 0.5 - 0.25j
-    assert net.z0.dtype == np.float64
-    np.testing.assert_array_equal(net.z0, [50.0, 50.0])
+    assert net.z0.dtype == np.complex128
+    assert net.z0.shape == (3, 2)
+    np.testing.assert_array_equal(net.z0, np.full((3, 2), 50.0 + 0j))
     assert repr(net) == "<Network 2-port, 3 frequency points>"
 
 
-def test_network_custom_z0() -> None:
+def test_network_custom_z0_is_broadcast_over_the_sweep() -> None:
+    """One value per port is tiled across the frequencies.
+
+    That is the shape every Touchstone file declares, so it is the shape a
+    caller is likeliest to have; z0 itself is (F, N) so it can also hold a
+    reference that genuinely varies with frequency.
+    """
+    f = np.array([1e9, 2e9])
+    s = np.zeros((2, 3, 3), dtype=np.complex128)
+    net = ts.Network(f, s, z0=np.array([50.0, 75.0, 50.0]))
+
+    assert net.z0.shape == (2, 3)
+    np.testing.assert_array_equal(net.z0, [[50, 75, 50], [50, 75, 50]])
+
+
+def test_network_accepts_a_per_frequency_z0() -> None:
+    f = np.array([1e9, 2e9])
+    s = np.zeros((2, 2, 2), dtype=np.complex128)
+    z0 = np.array([[50.0, 75.0], [50.0 + 1j, 75.0 - 2j]])
+    net = ts.Network(f, s, z0=z0)
+
+    np.testing.assert_array_equal(net.z0, z0)
+
+
+def test_network_z0_accepts_real_input_and_plain_sequences() -> None:
+    """Reference impedances are real in every published version of the format,
+    so a caller holding real values is the ordinary case, not an error.
+
+    Every numeric dtype and both accepted shapes go through one conversion, so
+    a 2-D integer array -- the natural way to hand over a per-frequency z0 --
+    is not refused where the 1-D one is accepted.
+    """
+    f = np.array([1e9])
+    s = np.zeros((1, 2, 2), dtype=np.complex128)
+
+    for z0 in (
+        [50.0, 75.0],
+        (50, 75),
+        [[50, 75]],
+        np.array([50, 75]),
+        np.array([50, 75], dtype=np.float32),
+        np.array([[50, 75]]),
+        np.array([[50.0, 75.0]]),
+    ):
+        net = ts.Network(f, s, z0=z0)
+        assert net.z0.dtype == np.complex128
+        np.testing.assert_array_equal(net.z0, [[50 + 0j, 75 + 0j]])
+
+
+def test_network_z0_rejects_non_numeric_input() -> None:
+    f = np.array([1e9])
+    s = np.zeros((1, 2, 2), dtype=np.complex128)
+    with pytest.raises(ValueError, match="real or complex numbers"):
+        # Deliberately ill-typed. The stub already forbids this; what is being
+        # checked is that the runtime says so too, for callers without one.
+        ts.Network(f, s, z0="nonsense")  # pyright: ignore[reportArgumentType]
+
+
+def test_network_rejects_a_z0_that_fits_neither_shape() -> None:
     f = np.array([1e9])
     s = np.zeros((1, 3, 3), dtype=np.complex128)
-    net = ts.Network(f, s, z0=np.array([50.0, 75.0, 50.0]))
-    np.testing.assert_array_equal(net.z0, [50.0, 75.0, 50.0])
+    with pytest.raises(ValueError, match=r"z0 must have shape \(3,\) or \(1, 3\)"):
+        ts.Network(f, s, z0=np.array([50.0, 75.0]))
 
 
 @pytest.mark.parametrize(

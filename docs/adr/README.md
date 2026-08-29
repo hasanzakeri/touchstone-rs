@@ -23,3 +23,6 @@ Decisions that shape this project, recorded at the point they were made.
 | [0005](0005-test-data-provenance-and-licensing.md) | Test data provenance and licensing | Accepted |
 | [0006](0006-data-set-accumulation-and-line-wrapping.md) | Data-set accumulation and line-wrapping tolerance | Accepted |
 | [0007](0007-noise-parameter-section.md) | The noise-parameter section: finding it, and what it means | Accepted |
+| [0008](0008-touchstone-2-dispatch-and-keywords.md) | Touchstone 2.0: version dispatch and the keyword model | Accepted |
+| [0009](0009-reference-impedance-and-the-1-1-option-line.md) | Reference impedance: a per-frequency complex `z0`, and the Version 1.1 option line | Accepted |
+| [0010](0010-effective-noise-resistance-across-versions.md) | Effective noise resistance across spec versions | Accepted |

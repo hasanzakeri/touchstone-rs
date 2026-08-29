@@ -11,25 +11,32 @@
 //! (see [`DataSets::flush`] and ADR 0007). Parameter types other than `S`
 //! are rejected with a message that names the limit rather than looking
 //! like a bug (see ADR 0004).
+//!
+//! Everything here is inference. A v1 file states its frequency unit, its
+//! value format and its reference resistance, and nothing else — not the port
+//! count, not where the network data ends. The arithmetic that turns a
+//! validated pair or a validated noise row into a value is not inference and
+//! lives in the parent module, shared with [`super::v2`].
 
 use num_complex::Complex64;
 
+use super::keyword::{looks_like_keyword, parse_keyword_line};
+use super::{
+    NOISE_VALUES_PER_SET, broadcast_reference, check_option_scope, err, noise_point_from_values,
+    reference_per_port, to_complex, values_per_set,
+};
 use crate::ParseOptions;
 use crate::error::{Error, ParseErrorKind};
-use crate::lines::{has_cr_only_line_endings, logical_lines, without_trailing_eof_marker};
-use crate::model::{Format, Metadata, Network, NoiseData, Parameter, Version};
+use crate::lines::logical_lines;
+use crate::model::{Format, Metadata, Network, NoiseData, Version};
 use crate::option_line::{Options, parse_option_line};
 
 /// Parse a v1 Touchstone file.
+///
+/// The trailing DOS end-of-file marker and carriage-return-only line endings
+/// are both dealt with by [`super::parse`] before the version is known, since
+/// neither is a property of either grammar.
 pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Error> {
-    // A DOS-era exporter may sign off with a `0x1A`. It is not data, and it
-    // is not whitespace either, so it has to come off before tokenizing.
-    let input = without_trailing_eof_marker(input);
-
-    if has_cr_only_line_endings(input) {
-        return Err(err(1, ParseErrorKind::UnsupportedLineEndings));
-    }
-
     let mut comments: Vec<String> = Vec::new();
     let mut options: Option<Options> = None;
     let mut option_line: Option<String> = None;
@@ -76,6 +83,19 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
             continue;
         }
 
+        // A `[` can only ever have been meant as a keyword: no data line
+        // starts with one. Keywords are not permitted in 1.x files at all, so
+        // this is either a 2.0 file whose `[Version]` is missing or misplaced,
+        // or a typo in one. Either way the reader needs to be told that, and
+        // not that some line holds an unparseable number.
+        if looks_like_keyword(line.content) {
+            let keyword = parse_keyword_line(line.content, line.number)?;
+            return Err(err(
+                line.number,
+                ParseErrorKind::V2KeywordInV1File(keyword.keyword.as_str()),
+            ));
+        }
+
         let opts_ref = options
             .as_ref()
             .ok_or_else(|| err(line.number, ParseErrorKind::DataBeforeOptionLine))?;
@@ -115,18 +135,40 @@ pub(crate) fn parse_v1(input: &str, opts: &ParseOptions) -> Result<Network, Erro
     }
     let n = sets.nports.expect("set alongside the first data set");
 
+    // The option line is where the mismatch is, not the data — the count only
+    // became checkable once the port count was known, several hundred lines
+    // later.
+    let option_line_at = option_line_number.expect("set alongside `options`");
+    let per_port = reference_per_port(&opts_ref.resistances, n, "the option line", option_line_at)?;
+    let z0 = broadcast_reference(&per_port, sets.freq_hz.len());
+
     Ok(Network {
         freq_hz: sets.freq_hz,
         s: sets.s,
         nports: n,
-        z0: vec![opts_ref.resistance; n],
+        z0,
         noise: sets.noise,
         metadata: Metadata {
-            version: Version::V1,
+            // A per-port `R` list is what the 2.1 document calls a Version 1.1
+            // file. Nothing in the file says so — 1.x files carry no
+            // `[Version]` keyword — so the option line's shape is the only
+            // evidence there is.
+            version: if opts_ref.resistances.len() > 1 {
+                Version::V1_1
+            } else {
+                Version::V1_0
+            },
             freq_unit: opts_ref.freq_unit,
             parameter: opts_ref.parameter,
             format: opts_ref.format,
-            resistance: opts_ref.resistance,
+            resistances: opts_ref.resistances,
+            // All three are v2 keywords, so a v1 file says nothing about any
+            // of them. A v1 2-port is always `S21First` and always Full, but
+            // it never *states* that, and `None` is what records the
+            // difference between a file that said so and one that did not.
+            reference: None,
+            matrix_format: None,
+            two_port_order: None,
             option_line,
             comments,
         },
@@ -322,7 +364,7 @@ impl<'a> DataSets<'a> {
         let scale = opts.freq_unit.to_hz();
 
         if self.noise.is_some() {
-            return self.flush_noise(scale);
+            return self.flush_noise(scale, opts);
         }
 
         let n = match self.nports {
@@ -354,7 +396,7 @@ impl<'a> DataSets<'a> {
         if self.at_noise_boundary(n, opts) {
             self.noise = Some(NoiseData::default());
             self.noise_line = line;
-            return self.flush_noise(scale);
+            return self.flush_noise(scale, opts);
         }
 
         let expected = values_per_set(n, line)?;
@@ -389,28 +431,25 @@ impl<'a> DataSets<'a> {
 
     /// Turn the buffered five values into one noise point.
     ///
-    /// Spec v1.1 §3 p10 gives the entries as `<freq> <NFmin dB> <|Γopt|>
-    /// <∠Γopt> <Rn>` and marks the third and fourth **"(MA)"** — a linear
-    /// magnitude and an angle in degrees — *whatever* the option line's value
-    /// format says. So Γopt is built with [`from_polar`] even in an `RI` or
-    /// `DB` file, and the three ADS exports of one device in `tests/data/`
-    /// confirm it: their noise sections are byte-for-byte identical while
-    /// their S-data is written three different ways.
+    /// The validation and the polar conversion are
+    /// [`super::noise_point_from_values`], shared with v2: the five columns
+    /// mean the same thing in both spec versions, Γopt's unconditional `(MA)`
+    /// reading included.
     ///
-    /// `Rn` is stored exactly as written. Spec p11 says both it and Γopt are
-    /// given against the option line's `R`, so what the file holds is already
-    /// normalized; denormalizing here would invent a quantity the file does
-    /// not contain and cost the writer its round trip. `z0` sits on the same
-    /// [`Network`] for anyone who wants ohms.
+    /// What is v1's own is everything around them. The section had to be
+    /// *found* rather than announced, so a row of the wrong length is reported
+    /// against the line the section was judged to start on — that is usually
+    /// where the real mistake is.
     ///
-    /// Nothing here range-checks the values. `|Γopt|` above 1 is unphysical
-    /// and Keysight's own documented example writes it *negative*; p10
-    /// likewise leaves clamping an out-of-range `Rn` to the simulator, as
-    /// something it *may* do. This is an I/O layer — it reports the file.
-    fn flush_noise(&mut self, scale: f64) -> Result<(), Error> {
+    /// `Rn` is stored exactly as written. Spec v1.1 §3 p11 says both it and
+    /// Γopt are given against the option line's `R`, so what a v1 file holds
+    /// is already normalized; denormalizing here would invent a quantity the
+    /// file does not contain and cost the writer its round trip. A v2 file
+    /// writes the same column in ohms instead — see ADR 0010.
+    fn flush_noise(&mut self, scale: f64, opts: &Options) -> Result<(), Error> {
         let line = self.block_line;
         let found = self.block.len();
-        if found != NOISE_VALUES_PER_SET {
+        let Ok(values) = <&[f64; NOISE_VALUES_PER_SET]>::try_from(&self.block[..]) else {
             return Err(err(
                 line,
                 ParseErrorKind::MalformedNoiseLine {
@@ -418,37 +457,9 @@ impl<'a> DataSets<'a> {
                     noise_starts_at: self.noise_line,
                 },
             ));
-        }
-        let &[in_units, nfmin_db, gamma_magnitude, gamma_angle_deg, rn] = &self.block[..] else {
-            unreachable!("length checked immediately above");
         };
-
-        let frequency = in_units * scale;
-        if !frequency.is_finite() {
-            return Err(err(
-                line,
-                ParseErrorKind::InvalidNumber(self.frequency_token.to_string()),
-            ));
-        }
-        // Unlike the S-values, these are checked before conversion rather
-        // than after. The two are equivalent for Γopt — finite inputs to
-        // `from_polar` cannot produce a non-finite output, and a non-finite
-        // input always does — and NFmin and Rn are stored as written, so
-        // there is no conversion to check downstream of. Doing it here buys
-        // a message that names which of five bare numbers was the problem.
-        for (column, value) in [
-            ("nfmin", nfmin_db),
-            ("|gamma_opt|", gamma_magnitude),
-            ("angle(gamma_opt)", gamma_angle_deg),
-            ("rn", rn),
-        ] {
-            if !value.is_finite() {
-                return Err(err(
-                    line,
-                    ParseErrorKind::NonFiniteNoiseValue { column, value },
-                ));
-            }
-        }
+        let (frequency, nfmin_db, gamma_opt, rn) =
+            noise_point_from_values(values, scale, line, self.frequency_token)?;
 
         let noise = self
             .noise
@@ -468,53 +479,15 @@ impl<'a> DataSets<'a> {
 
         noise.freq_hz.push(frequency);
         noise.nfmin_db.push(nfmin_db);
-        noise
-            .gamma_opt
-            .push(from_polar(gamma_magnitude, gamma_angle_deg));
+        noise.gamma_opt.push(gamma_opt);
         noise.rn.push(rn);
+        // Spec v1.1 §3 p11 normalizes `Rn` to the option line's `R`; the 2.1
+        // document adds that in a per-port option line it is *port 1's* value
+        // specifically. One value or several, that is `resistances[0]`.
+        noise.rn_ohms.push(rn * opts.resistances[0]);
         self.block.clear();
         Ok(())
     }
-}
-
-/// Values in one noise data set: frequency, NFmin, |Γopt|, ∠Γopt, Rn.
-///
-/// Spec v1.1 §3 p10 puts all five on one line, and the odd/even rule makes
-/// that automatic — five is odd, so every noise line opens a set of its own
-/// and closes as soon as it is full. A noise point in a conforming file is
-/// therefore never accumulated across lines.
-///
-/// A row split some other way — 3 + 2, say — still adds up to five and is
-/// accepted, which is the same wrapping tolerance ADR 0006 already grants
-/// S-data and is admitted here for the same reason: the values and their
-/// order are unambiguous. Any split that does *not* total five is reported
-/// as the malformed noise line it is.
-pub(crate) const NOISE_VALUES_PER_SET: usize = 5;
-
-/// Values in one data set for an `n`-port network: a frequency plus one
-/// pair per matrix entry.
-///
-/// `None` for a port count that cannot describe a data set at all: zero, or
-/// one so large that `1 + 2n²` overflows a `usize`.
-///
-/// This is not the arbitrary ceiling ADR 0006 declined to impose. Nothing
-/// vets the count before it arrives — `parse_file` takes it from the
-/// filename, so `x.s99999999999p` hands over 10¹¹ ports — and a count whose
-/// data set will not fit in a `usize` cannot describe a file that fits on a
-/// disk either. Left unchecked the multiplication wraps, and a wrapped
-/// `expected` that happens to match the accumulated length would send
-/// [`push_point`] indexing past the end of its slice.
-fn values_per_point(n: usize) -> Option<usize> {
-    if n == 0 {
-        return None;
-    }
-    n.checked_mul(n)?.checked_mul(2)?.checked_add(1)
-}
-
-/// [`values_per_point`], or the error to report for a port count that cannot
-/// describe a data set.
-fn values_per_set(n: usize, line: usize) -> Result<usize, Error> {
-    values_per_point(n).ok_or_else(|| err(line, ParseErrorKind::UnusablePortCount { nports: n }))
 }
 
 /// Port count implied by the size of one complete data set.
@@ -537,20 +510,6 @@ fn nports_from_data_set(len: usize) -> Option<usize> {
     let entries = (len - 1) / 2;
     let n = entries.isqrt();
     (n * n == entries).then_some(n)
-}
-
-/// Reject parameter types outside this version's scope.
-///
-/// Spec v1.1 §3 permits `S`/`Y`/`Z`/`G`/`H` at every port count; we read `S`
-/// only. The value format is not restricted: all three convert.
-fn check_option_scope(opts: &Options, line: usize) -> Result<(), Error> {
-    if opts.parameter != Parameter::S {
-        return Err(err(
-            line,
-            ParseErrorKind::UnsupportedParameter(opts.parameter),
-        ));
-    }
-    Ok(())
 }
 
 /// Append one frequency point, converting to complex and reordering to
@@ -595,83 +554,10 @@ fn push_point(
     Ok(())
 }
 
-/// Build a complex value from an on-disk pair, per spec v1.1 §3 p5.
-fn to_complex(a: f64, b: f64, format: Format) -> Complex64 {
-    match format {
-        Format::Ri => Complex64::new(a, b),
-        // Angles are in degrees "by convention" (§2 rule 5) and explicitly
-        // for the data formats (§3 p5).
-        Format::Ma => from_polar(a, b),
-        // "DB for dB-angle (dB = 20*log10|magnitude|)" — so the magnitude is
-        // 10^(dB/20), and the angle is handled exactly as in MA.
-        Format::Db => from_polar(10f64.powf(a / 20.0), b),
-    }
-}
-
-/// A magnitude and an angle *in degrees* as a complex number.
-///
-/// Written out rather than calling `Complex64::from_polar`, which lives
-/// behind num-complex's `std` feature — deliberately off here, so the
-/// workspace's `num-complex` unifies with the range rust-numpy accepts. The
-/// arithmetic is the same.
-fn from_polar(magnitude: f64, angle_deg: f64) -> Complex64 {
-    let radians = angle_deg.to_radians();
-    Complex64::new(magnitude * radians.cos(), magnitude * radians.sin())
-}
-
-fn err(line: usize, kind: ParseErrorKind) -> Error {
-    Error::Parse { line, kind }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Tolerance for a value that has been through a polar conversion.
-    fn close(a: Complex64, b: Complex64) -> bool {
-        (a - b).l1_norm() < 1e-12
-    }
-
-    #[test]
-    fn values_per_point_counts_a_frequency_plus_one_pair_per_entry() {
-        assert_eq!(values_per_point(1), Some(3));
-        assert_eq!(values_per_point(2), Some(9));
-        assert_eq!(values_per_point(4), Some(33));
-        assert_eq!(values_per_point(16), Some(513));
-    }
-
-    /// The port count is not vetted before it reaches here: `parse_file`
-    /// takes it from the filename. Unchecked, `1 + 2n²` wraps, and a wrapped
-    /// size that happened to match the accumulated length would send
-    /// `push_point` past the end of its slice.
-    #[test]
-    fn a_port_count_that_cannot_describe_a_data_set_is_rejected_not_wrapped() {
-        // Zero ports is not a network, and would yield a `Network` whose
-        // `at()` panics on every index.
-        assert_eq!(values_per_point(0), None);
-
-        // Both overflow points, written against `usize::BITS` so the test
-        // means the same thing on a 32-bit target.
-        //
-        // `n * n` overflows from 2^(bits/2) up.
-        let square_overflows = 1usize << (usize::BITS / 2);
-        assert!(square_overflows.checked_mul(square_overflows).is_none());
-        assert_eq!(values_per_point(square_overflows), None);
-        assert_eq!(values_per_point(usize::MAX), None);
-
-        // One below that, `n * n` fits and the *doubling* is what overflows
-        // — the step a `checked_mul` on the square alone would miss.
-        let doubling_overflows = square_overflows - 1;
-        assert!(
-            doubling_overflows
-                .checked_mul(doubling_overflows)
-                .is_some_and(|sq| sq.checked_mul(2).is_none())
-        );
-        assert_eq!(values_per_point(doubling_overflows), None);
-
-        // Ordinary counts stay exact rather than clamped.
-        assert_eq!(values_per_point(1000), Some(2_000_001));
-    }
+    use crate::parser::values_per_point;
 
     #[test]
     fn a_data_set_length_names_its_port_count() {
@@ -725,49 +611,6 @@ mod tests {
         push_point(&mut s, &pairs, 3, Format::Ri).expect("finite");
         let reals: Vec<f64> = s.iter().map(|z| z.re).collect();
         assert_eq!(reals, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
-    }
-
-    #[test]
-    fn magnitude_angle_converts_through_the_unit_circle() {
-        assert!(close(
-            to_complex(2.0, 0.0, Format::Ma),
-            Complex64::new(2.0, 0.0)
-        ));
-        assert!(close(
-            to_complex(2.0, 90.0, Format::Ma),
-            Complex64::new(0.0, 2.0)
-        ));
-        assert!(close(
-            to_complex(1.0, 180.0, Format::Ma),
-            Complex64::new(-1.0, 0.0)
-        ));
-        assert!(close(
-            to_complex(1.0, -90.0, Format::Ma),
-            Complex64::new(0.0, -1.0)
-        ));
-    }
-
-    #[test]
-    fn db_is_twenty_log_ten_of_the_magnitude() {
-        // 20*log10(10) = 20 dB, and 0 dB is unity.
-        assert!(close(
-            to_complex(20.0, 0.0, Format::Db),
-            Complex64::new(10.0, 0.0)
-        ));
-        assert!(close(
-            to_complex(0.0, 0.0, Format::Db),
-            Complex64::new(1.0, 0.0)
-        ));
-        // -6.020599913 dB is a half.
-        assert!(close(
-            to_complex(-6.020599913279624, 0.0, Format::Db),
-            Complex64::new(0.5, 0.0)
-        ));
-        // A 10*log10 mix-up would put this at 0.1, not 0.31622...
-        assert!(close(
-            to_complex(-10.0, 0.0, Format::Db),
-            Complex64::new(0.316_227_766_016_837_9, 0.0)
-        ));
     }
 
     /// The real ADS `DB` export writes a zero-magnitude S12 as `-inf`, which

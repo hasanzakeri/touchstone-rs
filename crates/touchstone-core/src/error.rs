@@ -105,6 +105,91 @@ pub enum ParseErrorKind {
         column: &'static str,
         value: f64,
     },
+    /// A line opening with `[` that is not a usable keyword: an unclosed
+    /// bracket, whitespace inside the brackets, or an argument glued to the
+    /// closing bracket. Reported rather than read as data, because no data
+    /// line can begin with `[` and guessing would turn a typo into silence.
+    MalformedKeyword {
+        /// The line as written, trimmed.
+        text: String,
+        /// What is wrong with it.
+        detail: &'static str,
+    },
+    /// A bracketed keyword this specification does not define.
+    UnknownKeyword(String),
+    /// A v2 keyword in a file with no `[Version]`. Keywords are not permitted
+    /// in 1.x files, so either the `[Version]` line is missing or the file is
+    /// not what it appears to be — both worth saying outright, since the
+    /// alternative is blaming a data line for an unparseable number.
+    V2KeywordInV1File(&'static str),
+    /// A `[Version]` argument this library does not read.
+    UnsupportedVersion(String),
+    /// A keyword that may appear once appeared twice.
+    DuplicateKeyword(&'static str),
+    /// A keyword the file cannot do without.
+    MissingKeyword(&'static str),
+    /// A keyword in a position the specification does not allow.
+    KeywordOutOfOrder {
+        keyword: &'static str,
+        /// Where it should have been.
+        detail: &'static str,
+    },
+    /// A keyword that is not permitted in this particular file — the rule is
+    /// conditional rather than absolute, so the message carries the condition.
+    KeywordNotPermitted {
+        keyword: &'static str,
+        detail: String,
+    },
+    /// A keyword's argument was missing, unreadable, or not one of the values
+    /// the keyword accepts.
+    InvalidKeywordArgument {
+        keyword: &'static str,
+        detail: String,
+    },
+    /// A count a keyword declared disagrees with what the file then contained.
+    DeclaredCountMismatch {
+        keyword: &'static str,
+        declared: usize,
+        found: usize,
+    },
+    /// A declared shape the file is far too small to contain even once: a
+    /// single data point would need more values than the whole file can hold.
+    ///
+    /// Caught before anything is sized from the declared count, because those
+    /// counts scale as `n²` and a file of a hundred bytes can name a port
+    /// count whose matrix would not fit in memory.
+    DeclaredShapeExceedsFile {
+        keyword: &'static str,
+        values_per_point: usize,
+        file_values: usize,
+    },
+    /// The caller asserted a port count that the file contradicts.
+    PortCountMismatch {
+        requested: usize,
+        declared: usize,
+    },
+    /// A noise section in a file that is not 2-port. Noise parameters are
+    /// defined for 2-port networks only, in both spec versions.
+    NoiseRequiresTwoPorts {
+        nports: usize,
+    },
+    /// Mixed-mode data, which this library does not read.
+    MixedModeUnsupported,
+    /// Content after `[End]`, which spec 2.0 p25 says to treat as an error.
+    TrailingDataAfterEnd,
+    /// A list of reference resistances that does not have one entry per port.
+    ///
+    /// Reachable two ways, so the message says which: a "Version 1.1" option
+    /// line whose `R` list is the wrong length, or a v2 `[Reference]` keyword
+    /// with the wrong number of arguments. A single option-line value is
+    /// always legal — it is the reference for every port — so this only ever
+    /// fires on a list of two or more.
+    WrongResistanceCount {
+        /// Where the values came from, named as the file spells it.
+        source: &'static str,
+        expected: usize,
+        found: usize,
+    },
     /// A network parameter type this version cannot handle yet.
     UnsupportedParameter(Parameter),
     /// Carriage-return-only line endings, which would collapse the whole
@@ -172,6 +257,77 @@ impl fmt::Display for ParseErrorKind {
             ParseErrorKind::NonFiniteNoiseValue { column, value } => {
                 write!(f, "noise {column} value '{value}' is not a finite number")
             }
+            ParseErrorKind::MalformedKeyword { text, detail } => {
+                write!(f, "malformed keyword '{text}': {detail}")
+            }
+            ParseErrorKind::UnknownKeyword(name) => write!(f, "unknown keyword '{name}'"),
+            ParseErrorKind::V2KeywordInV1File(keyword) => write!(
+                f,
+                "{keyword} is a Touchstone 2.0 keyword, but this file has no \
+                 [Version] keyword and is being read as 1.0 (keywords are not \
+                 permitted in 1.0 files)"
+            ),
+            ParseErrorKind::UnsupportedVersion(argument) => write!(
+                f,
+                "unsupported version '{argument}': only 2.0 and 2.1 are supported"
+            ),
+            ParseErrorKind::DuplicateKeyword(keyword) => {
+                write!(f, "{keyword} may appear only once")
+            }
+            ParseErrorKind::MissingKeyword(keyword) => write!(f, "missing {keyword}"),
+            ParseErrorKind::KeywordOutOfOrder { keyword, detail } => {
+                write!(f, "{keyword} is out of order: {detail}")
+            }
+            ParseErrorKind::KeywordNotPermitted { keyword, detail } => {
+                write!(f, "{keyword} is not permitted here: {detail}")
+            }
+            ParseErrorKind::InvalidKeywordArgument { keyword, detail } => {
+                write!(f, "invalid {keyword} argument: {detail}")
+            }
+            ParseErrorKind::DeclaredCountMismatch {
+                keyword,
+                declared,
+                found,
+            } => write!(f, "{keyword} declares {declared}, but the file has {found}"),
+            ParseErrorKind::DeclaredShapeExceedsFile {
+                keyword,
+                values_per_point,
+                file_values,
+            } => write!(
+                f,
+                "{keyword} implies {values_per_point} values per data point, but \
+                 the whole file holds at most {file_values}"
+            ),
+            ParseErrorKind::PortCountMismatch {
+                requested,
+                declared,
+            } => write!(
+                f,
+                "a {requested}-port network was requested, but [Number of Ports] \
+                 declares {declared}"
+            ),
+            ParseErrorKind::NoiseRequiresTwoPorts { nports } => write!(
+                f,
+                "noise parameters are defined for 2-port networks only, but this \
+                 file has {nports} ports"
+            ),
+            ParseErrorKind::MixedModeUnsupported => write!(
+                f,
+                "mixed-mode data is not supported: this file uses [Mixed-Mode Order], \
+                 whose network data is arranged by mode rather than by port"
+            ),
+            ParseErrorKind::TrailingDataAfterEnd => {
+                write!(f, "data after [End]")
+            }
+            ParseErrorKind::WrongResistanceCount {
+                source,
+                expected,
+                found,
+            } => write!(
+                f,
+                "{source} gives {found} reference resistances for a \
+                 {expected}-port network"
+            ),
             ParseErrorKind::UnsupportedParameter(p) => write!(
                 f,
                 "unsupported parameter {}: only s-parameters are supported in this version",
